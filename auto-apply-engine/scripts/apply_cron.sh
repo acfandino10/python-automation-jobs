@@ -10,8 +10,10 @@ RUN_LIMIT="${RUN_LIMIT:-4}"
 # How many submitted applications are allowed on this machine's calendar day.
 DAILY_LIMIT="${DAILY_LIMIT:-10}"
 # Manifest slug or title. Comma-separate several, for example "backend-engineer,data-engineer".
-# When input/ has several résumés, the same ROLES value is applied for each person.
+# When input/ has several résumés, the same ROLES value is applied for each selected person.
 : "${ROLES:?Set ROLES to a role slug from the manifest}"
+# Person slugs or names. all applies every person. Example: ana-fandino,camila-fandino
+PEOPLE="${PEOPLE:-all}"
 
 mkdir -p "$ROOT/output/logs"
 LOCKDIR="$ROOT/output/logs/apply.lock"
@@ -22,6 +24,7 @@ fi
 trap 'rmdir "$LOCKDIR"' EXIT
 
 exec "$ROOT/.venv/bin/python" "$ROOT/apply_jobs.py" \
+  --people "$PEOPLE" \
   --roles "$ROLES" \
   --auto-submit \
   --headless \

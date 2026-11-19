@@ -20,6 +20,8 @@ from src.models import (
     RoleSuggestion,
     SuggestionList,
     TailoredCV,
+    split_phone,
+    split_place,
     unique_slug,
 )
 
@@ -56,7 +58,7 @@ Return JSON only.
 
 _TAILOR_SYSTEM = """You rewrite a résumé for one target role using only facts from the source CV and the contact profile.
 Return one JSON object with these keys:
-target_role, full_name, headline, contact_line, summary, skills, experience, education, projects, search_keywords.
+target_role, full_name, first_name, last_name, headline, email, phone_prefix, phone, linkedin, city, country, summary, skills, experience, education, projects, search_keywords.
 
 Rules:
 - Do not invent employers, titles, dates, schools, degrees, tools, products, or metrics.
@@ -65,6 +67,9 @@ Rules:
 - skills must already be demonstrated in the source CV.
 - summary is 3 or 4 sentences in third person. Do not use I or my.
 - headline is one line and must not claim a specialty the CV does not support.
+- full_name is the whole name. first_name and last_name are that name split. Do not invent a different name.
+- phone_prefix is only the calling code, such as +57. phone is the number without that prefix.
+- city is the city only. country is the country only. linkedin is the profile URL.
 - experience items use title, company, location, dates, bullets.
 - education items use degree, school, dates, details.
 - projects items use name, details. Include a project only when the source CV contains it.
@@ -104,13 +109,20 @@ def build_tailored_cv(
         raise LLMError(f"The tailored CV was not in the expected shape: {exc}") from exc
 
     cv.target_role = role_title.strip() or cv.target_role
-    if applicant.full_name:
+    if applicant.full_name or applicant.first_name or applicant.last_name:
         cv.full_name = applicant.full_name
-    contact = applicant.contact_line()
-    if contact:
-        cv.contact_line = contact
-    elif not cv.contact_line:
-        cv.contact_line = ""
+        cv.first_name = applicant.first_name
+        cv.last_name = applicant.last_name
+    if applicant.contact_line():
+        prefix, number = split_phone(applicant.phone)
+        city, country = split_place(applicant.location)
+        cv.email = applicant.email
+        cv.phone_prefix = prefix
+        cv.phone = number
+        cv.linkedin = applicant.linkedin_url
+        cv.portfolio = applicant.portfolio_url
+        cv.city = city
+        cv.country = country
 
     cv.summary = " ".join(cv.summary.split())[:1200]
     cv.headline = " ".join(cv.headline.split())[:180]

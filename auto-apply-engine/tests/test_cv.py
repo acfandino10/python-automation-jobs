@@ -54,6 +54,29 @@ Software engineer with several years of Python and SQL work.
     assert person.email != shared.email
 
 
+def test_contact_line_splits_into_form_fields():
+    from src.models import TailoredCV
+
+    cv = TailoredCV.model_validate(
+        {
+            "target_role": "Engineer",
+            "contact_line": (
+                "ana.camila95@outlook.com | +57 319 482 6159 | "
+                "https://linkedin.com/in/ana-camila-fandino | Bogotá, Colombia"
+            ),
+        }
+    )
+    assert cv.email == "ana.camila95@outlook.com"
+    assert cv.phone_prefix == "+57"
+    assert cv.phone == "319 482 6159"
+    assert cv.linkedin == "https://linkedin.com/in/ana-camila-fandino"
+    assert cv.city == "Bogotá"
+    assert cv.country == "Colombia"
+    dumped = cv.model_dump()
+    assert "contact_line" not in dumped
+    assert dumped["phone_prefix"] == "+57"
+
+
 def test_slug_is_stable_and_unique():
     assert slugify("Senior Python Engineer") == "senior-python-engineer"
     used: set[str] = set()
@@ -127,7 +150,15 @@ def test_grounding_drops_invented_claims(tmp_path: Path):
     )
 
     assert cv.full_name == "Jordan Lee"
-    assert "jordan@example.com" in cv.contact_line
+    assert cv.first_name == "Jordan"
+    assert cv.last_name == "Lee"
+    assert cv.email == "jordan@example.com"
+    assert cv.phone_prefix == "+1"
+    assert cv.phone == "555 0100"
+    assert cv.city == "Remote"
+    assert cv.country == ""
+    assert "contact_line" not in cv.model_dump()
+    assert cv.contact_line == "jordan@example.com | +1 555 0100 | Remote"
     assert [job.company for job in cv.experience] == ["Northwind Analytics"]
     assert cv.experience[0].bullets == ["Built internal reporting tools used by 12 analysts."]
     assert cv.experience[0].dates == "2018-2024"

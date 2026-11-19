@@ -81,17 +81,18 @@ python generate_cvs.py \
 ```bash
 python apply_jobs.py --dry-run --limit 5
 python apply_jobs.py --roles senior-python-engineer --limit 10
+python apply_jobs.py --people ana-fandino --auto-submit --limit 10
 python apply_jobs.py --auto-submit --limit 3
 ```
 
 What a run does:
 
-1. Loads one manifest, or every manifest under `output/people/` when more than one person was generated. Each person is applied with their own name and email, their own log, and their own browser login.
+1. Loads one manifest, or the people under `output/people/` when more than one person was generated. A terminal shows a checkbox with All and each person, then the same checkbox for that person's roles, then a checkbox for Indeed, LinkedIn, and Greenhouse. Enter on the highlighted row selects that row. Space checks several rows, then Enter confirms. Selecting All uses every person, every role, or every board. Selecting one name, role, or board uses only that one. `--people ana-fandino,camila-fandino` or `--people all` skips the checkbox. A run without a terminal, including cron, applies every person unless `--people` is set. Each person is applied with their own name and email, their own log, and their own browser login.
 2. Searches Indeed and LinkedIn in a persistent Chromium profile (`SEARCH_BOARDS`). The first time a board asks you to sign in, sign in in that window and press Enter. The session is reused.
 3. Greenhouse is included when `SEARCH_BOARDS` contains `greenhouse` and `GREENHOUSE_BOARDS` lists public board slugs such as `stripe,airbnb`. Listing uses Greenhouse's public jobs API. The application form still opens in the browser.
 4. Scores each description against the tailored CV. Jobs under `MATCH_THRESHOLD` (default 75) are logged as `below_threshold` and skipped.
-5. Uploads that role's PDF, fills name, email, phone, LinkedIn, and location from that person's résumé, and drafts other short answers from the same text.
-6. Waits for you to type `submit` unless you passed `--auto-submit`.
+5. Uploads that role's PDF. When the form is open, an agent labels each visible control, checks those labels, and corrects them once. Chromium fills from those labels. If the agent fails, the same fields are filled by matching the label text. If name, email, or phone is not among those controls, a second agent looks at the other controls on the page and picks the right ones. Other short answers are drafted from the résumé.
+6. Waits for you to type `submit` unless you passed `--auto-submit`. Filling and navigation are not timed. If a step is stuck because the button cannot be found, it waits 5 minutes and then skips that job.
 
 `--urls jobs.txt` skips search and opens the listed URLs with one role's PDF. Pass a single `--roles` value with it.
 
@@ -117,7 +118,7 @@ Sign in once before turning the schedule on, in a visible browser:
 python apply_jobs.py --roles senior-python-engineer --limit 1
 ```
 
-Use a slug from that person's `manifest.json`. After that login, the session in `output/browser_profile/` (one person) or `output/people/<person>/browser_profile/` (several people) is what cron reuses. A scheduled run applies the same roles for each person, and each person has their own daily count.
+Use a slug from that person's `manifest.json`. After that login, the session in `output/browser_profile/` (one person) or `output/people/<person>/browser_profile/` (several people) is what cron reuses. A scheduled run applies the same roles for each selected person, and each person has their own daily count. `PEOPLE=all` is the default. Set `PEOPLE=ana-fandino` to schedule one person, or a comma-separated list for several.
 
 Edit `scripts/apply_cron.sh` or export the variables. This example allows 10 submitted applications per day, with at most 4 each time the job wakes up:
 

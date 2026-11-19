@@ -62,6 +62,8 @@ def test_person_slug_drops_a_trailing_cv_and_stays_unique():
 def test_extract_contact_reads_the_header():
     contact = extract_contact(ANA)
     assert contact.full_name == "Ana Example"
+    assert contact.first_name == "Ana"
+    assert contact.last_name == "Example"
     assert contact.email == "ana@example.com"
     assert contact.phone == "+57 319 482 6159"
     assert contact.linkedin_url == "https://linkedin.com/in/ana-example"

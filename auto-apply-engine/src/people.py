@@ -63,6 +63,8 @@ _NOT_NAMES = {
 
 _PROFILE_FIELDS = {
     "FULL_NAME": "full_name",
+    "FIRST_NAME": "first_name",
+    "LAST_NAME": "last_name",
     "EMAIL": "email",
     "PHONE": "phone",
     "LINKEDIN_URL": "linkedin_url",

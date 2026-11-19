@@ -1,8 +1,14 @@
 """Search job boards and fill applications with the CV generated for that role.
 
 The runner uses a persistent Playwright profile so the user can log in once.
-It pauses for sign-in, CAPTCHA, and any required field it cannot answer from
-the profile or the CV. It does not solve CAPTCHAs or invent work authorization.
+When an application form is open, a short agent reads the visible controls,
+labels each one, and corrects a label that does not fit the control. If that
+agent fails, Chromium fills from the label text instead. If name, email, or
+phone is still not among those controls, a second agent picks the right
+control from the rest of the page. Fields that are still empty are inferred
+from the profile and CV.
+It pauses for sign-in, CAPTCHA, and any required field it cannot answer.
+It does not solve CAPTCHAs or invent work authorization or salary.
 """
 
 from __future__ import annotations
@@ -11,6 +17,7 @@ import html as html_lib
 import json
 import random
 import re
+import select
 import sys
 import time
 import urllib.error
@@ -31,6 +38,30 @@ from src.errors import ConfigError, CVError, LLMError
 from src.llm import LLMClient
 from src.models import Applicant, JobFit, ManifestRole, ScreeningAnswer, TailoredCV
 from src.tracking import ApplicationLog, ApplicationRecord, utc_now
+
+JOB_LIMIT_SECONDS = 5 * 60
+
+
+class _JobTimeLimit(Exception):
+    """One job used its time. The run continues with the next job."""
+
+
+def _seconds_remaining(deadline: float, now: float) -> float:
+    return max(0.0, deadline - now)
+
+
+def _read_stdin(timeout: float) -> str | None:
+    """Read one line, or return None when ``timeout`` seconds pass."""
+    if timeout <= 0:
+        return None
+    ready, _, _ = select.select([sys.stdin], [], [], timeout)
+    if not ready:
+        return None
+    line = sys.stdin.readline()
+    if line == "":
+        return None
+    return line
+
 
 GENERIC_ROLE_WORDS = {
     "senior",
@@ -76,7 +107,10 @@ DESCRIPTION_SELECTORS = [
 
 COMPANY_SELECTORS = [
     ".job-details-jobs-unified-top-card__company-name",
+    ".job-details-jobs-unified-top-card__company-name a",
     ".jobs-unified-top-card__company-name",
+    ".jobs-unified-top-card__company-name a",
+    ".topcard__org-name-link",
     "[data-testid='inlineHeader-companyName']",
     ".jobsearch-InlineCompanyRating-companyHeader",
     ".company-name",
@@ -104,6 +138,46 @@ SUBMIT_SELECTORS = [
     "button:has-text('Send application')",
     "button:has-text('Submit')",
     "input[type='submit']",
+]
+
+LINKEDIN_EASY_APPLY_SELECTORS = [
+    ".jobs-apply-button--top-card",
+    "button[data-live-test-job-apply-button]",
+    ".jobs-s-apply button.jobs-apply-button",
+    ".jobs-search__job-details button[aria-label*='Easy Apply']",
+    ".jobs-details button[aria-label*='Easy Apply']",
+    "button[aria-label*='Easy Apply']",
+    "a[aria-label*='Easy Apply']",
+    "button.jobs-apply-button",
+]
+
+LINKEDIN_MODAL_SELECTORS = (
+    ".jobs-easy-apply-modal",
+    "div[data-test-modal-id='easy-apply-modal']",
+    ".jobs-easy-apply-content",
+)
+
+LINKEDIN_NEXT_SELECTORS = [
+    ".jobs-easy-apply-modal button[aria-label='Continue to next step']",
+    ".jobs-easy-apply-modal button[aria-label='Review your application']",
+    ".jobs-easy-apply-modal button[data-easy-apply-next-button]",
+    ".jobs-easy-apply-content button[aria-label='Continue to next step']",
+    ".jobs-easy-apply-content button[aria-label='Review your application']",
+    "button[aria-label='Continue to next step']",
+    "button[aria-label='Review your application']",
+    "button[data-easy-apply-next-button]",
+    ".jobs-easy-apply-modal footer button",
+    ".jobs-easy-apply-content footer button",
+]
+
+LINKEDIN_SUBMIT_SELECTORS = [
+    ".jobs-easy-apply-modal button[aria-label='Submit application']",
+    ".jobs-easy-apply-modal button[aria-label*='Submit application']",
+    ".jobs-easy-apply-content button[aria-label='Submit application']",
+    "button[aria-label='Submit application']",
+    "button[data-live-test-easy-apply-submit-button]",
+    ".jobs-easy-apply-modal footer button",
+    ".jobs-easy-apply-content footer button",
 ]
 
 _HUMAN_TEXT = (
@@ -137,11 +211,96 @@ Return JSON only.
 
 _ANSWER_SYSTEM = """You answer one job-application question from the candidate profile and CV.
 Return one JSON object: {"answer": "", "needs_review": false}
-Use only facts in the profile and CV. Do not invent employers, dates, metrics, or visa status.
-If the answer is not in the material, set needs_review to true and answer to "".
+Use only facts in the profile and CV. You may derive a fact the material supports, such as years of experience, current title, current employer, degree, or school.
+Do not invent employers, dates, metrics, visa status, or salary.
+If the material does not support an answer, set needs_review to true and answer to "".
 Plain text only, no markdown.
 Return JSON only.
 """
+
+_INFER_SYSTEM = """You fill job-application fields that are still empty.
+Return one JSON object: {"fields": [{"id": 0, "answer": ""}]}
+The profile and CV are the only source. Derive an answer when the material supports it, such as years of experience, current title, current employer, degree, school, city, or a skill.
+Do not invent employers, dates, metrics, visa status, or salary.
+If the material does not support an answer, set answer to "".
+When a field lists options, the answer must be exactly one of those options.
+Include every id from the input. Plain text only. Return JSON only.
+"""
+
+_TAG_SYSTEM = """You label controls on a job application form that is already open in the browser.
+Return one JSON object: {"fields": [{"id": 0, "tag": "email"}]}
+Use only these tags:
+first_name, last_name, full_name, email, phone, phone_prefix, linkedin, portfolio, city, country, location, school, salary, work_authorization, cover_letter, eeo, sensitive, agreement, screening, resume, skip
+Rules:
+- Decide from the label, the control name, the nearby text, the type, and the options together.
+- A box for the school, university, or college name is school. Degree level, graduation year, and GPA are screening.
+- A question that only mentions email, phone, or a name is screening. "Years of experience with email marketing" is screening, not email.
+- "First" or "Given name" is first_name. "Last", "Surname", or "Family name" is last_name. One "Name" box is full_name.
+- A phone country-code or dial-code control is phone_prefix. The control immediately before the phone number is phone_prefix, even when its label says Country. Search boxes and buttons are skip.
+- Gender, race, ethnicity, veteran, disability, and pronouns are eeo.
+- Passwords, SSN, date of birth, and government ids are sensitive.
+- Terms, privacy, and consent checkboxes are agreement.
+- Resume or CV file inputs are resume.
+- Every other question the candidate must answer is screening.
+Include every id from the input exactly once. Do not add ids. Return JSON only.
+"""
+
+_RECOVERY_SYSTEM = """You find controls for contact fields that were not found on the form.
+The missing tags are in "missing". The controls are the other fields on the open page.
+Return one JSON object: {"fields": [{"id": 0, "tag": "email"}]}
+Assign a missing tag only when that control is where the candidate types that fact.
+Use "skip" for every control that is not one of the missing fields.
+A question that only mentions a missing word is skip.
+Do not invent ids or tags. Return JSON only.
+"""
+
+_EXTRA_CONTROL_SELECTOR = "[role='combobox'], [role='textbox'], [contenteditable='true'], [role='spinbutton']"
+
+_PROFILE_TAGS = frozenset(
+    {
+        "first_name",
+        "last_name",
+        "full_name",
+        "email",
+        "phone",
+        "phone_prefix",
+        "linkedin",
+        "portfolio",
+        "city",
+        "country",
+        "location",
+        "school",
+    }
+)
+
+_FIELD_TAGS = _PROFILE_TAGS | frozenset(
+    {
+        "salary",
+        "work_authorization",
+        "cover_letter",
+        "eeo",
+        "sensitive",
+        "agreement",
+        "screening",
+        "resume",
+        "skip",
+    }
+)
+
+_SKIP_INPUT_TYPES = frozenset(
+    {
+        "input:hidden",
+        "input:submit",
+        "input:button",
+        "input:search",
+        "input:file",
+        "input:password",
+    }
+)
+
+_HELD_TAGS = _PROFILE_TAGS | frozenset({"salary", "work_authorization"})
+
+_CORE_CONTACT_TAGS = frozenset({"first_name", "last_name", "full_name", "email", "phone"})
 
 
 @dataclass
@@ -320,18 +479,59 @@ def yes_no_answer(question: str, authorization: str) -> str | None:
     return None
 
 
+def _humanize_control_name(name: str) -> str:
+    """Turn ``job_application[first_name]`` into ``first name``."""
+    match = re.search(r"\[([^\]]+)\]", name or "")
+    text = match.group(1) if match else (name or "")
+    if not text or text.startswith("field_") or text.startswith(":"):
+        return ""
+    return _label_text(text)
+
+
+def _label_text(label: str) -> str:
+    """Lowercase a label, and split first_name / firstName into separate words."""
+    text = label.replace("*", " ").replace("_", " ").replace("-", " ")
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
+    text = re.sub(r"linked\s+in", "linkedin", text, flags=re.IGNORECASE)
+    return " ".join(text.lower().split())
+
+
+def _looks_like_school_field(text: str) -> bool:
+    """A box for the institution name, not a degree, GPA, or graduation question."""
+    if not text or len(text) > 80:
+        return False
+    if "?" in text and not re.search(r"\b(school|university|college|institution)\b", text):
+        return False
+    if re.search(
+        r"\b(gpa|diploma|degree|graduat\w*|major|field of study|education level|level of education|highest)\b",
+        text,
+    ):
+        if not re.search(
+            r"\b(school name|university name|college name|institution name|name of (?:the )?(?:school|university|college))\b",
+            text,
+        ):
+            return False
+    return re.search(r"\b(school|university|college|institution|alma mater)\b", text) is not None
+
+
 def profile_value_for_label(label: str, applicant: Applicant) -> str | None:
-    text = " ".join(label.lower().split())
+    text = _label_text(label)
     if not text:
         return None
     if "given name" in text or (re.search(r"\bfirst\b", text) and "name" in text):
         return applicant.first_name or None
     if any(token in text for token in ("surname", "family name")) or (re.search(r"\blast\b", text) and "name" in text):
         return applicant.last_name or None
-    if "email" in text or "e-mail" in text:
+    if _looks_like_email_field(text):
         return applicant.email or None
-    if "phone" in text or "mobile" in text:
-        return applicant.phone or None
+    if _looks_like_phone_prefix_field(text):
+        return applicant.phone_prefix or None
+    if text == "country":
+        return _country_from_location(applicant.location)
+    if "city" in text and "authorization" not in text:
+        return _city_from_location(applicant.location) or applicant.location or None
+    if _looks_like_phone_field(text):
+        return applicant.phone_number or applicant.phone or None
     if "linkedin" in text:
         return applicant.linkedin_url or None
     if any(token in text for token in ("portfolio", "website", "github")) or (
@@ -340,8 +540,689 @@ def profile_value_for_label(label: str, applicant: Applicant) -> str | None:
         return applicant.portfolio_url or None
     if re.search(r"\b(city|location)\b", text) and "authorization" not in text:
         return applicant.location or None
+    if _looks_like_school_field(text):
+        return applicant.school or None
     if text in {"name", "name *"} or re.search(r"\b(full name|your name)\b", text):
         return applicant.full_name or None
+    return None
+
+
+def _looks_like_email_field(text: str) -> bool:
+    """True for a contact box, false for a question that only mentions email."""
+    if "?" in text or len(text) > 60:
+        return False
+    if re.search(r"\b(marketing|campaign|experience|years|skill|skills)\b", text):
+        return False
+    return "email" in text or "e-mail" in text
+
+
+def _looks_like_phone_prefix_field(text: str) -> bool:
+    """A calling-code box, such as Country code or Dial code, not the phone number."""
+    if "?" in text or len(text) > 60:
+        return False
+    return any(
+        token in text
+        for token in ("country code", "dial code", "calling code", "phone code", "phone prefix")
+    )
+
+
+def _looks_like_phone_field(text: str) -> bool:
+    if "?" in text or len(text) > 60:
+        return False
+    if _looks_like_phone_prefix_field(text):
+        return False
+    if re.search(r"\b(interview|screening)\b", text):
+        return False
+    return "phone" in text or "mobile" in text
+
+
+def value_for_tag(tag: str, applicant: Applicant) -> str | None:
+    """Profile text for a tag the model assigned to a live form control."""
+    city = _city_from_location(applicant.location) or ""
+    country = _country_from_location(applicant.location) or ""
+    values = {
+        "first_name": applicant.first_name,
+        "last_name": applicant.last_name,
+        "full_name": applicant.full_name,
+        "email": applicant.email,
+        "phone": applicant.phone_number or applicant.phone,
+        "phone_prefix": applicant.phone_prefix,
+        "linkedin": applicant.linkedin_url,
+        "portfolio": applicant.portfolio_url,
+        "city": city,
+        "country": country,
+        "location": applicant.location,
+        "school": applicant.school,
+        "salary": applicant.salary_expectation,
+        "work_authorization": applicant.work_authorization,
+    }
+    value = (values.get(tag) or "").strip()
+    return value or None
+
+
+def profile_value_for_field(tag: str | None, label: str, applicant: Applicant) -> str | None:
+    """Fill from the model tag. Keyword matching runs only when the control was not labeled."""
+    if tag in {"skip", "resume", "eeo", "sensitive", "agreement", "screening", "cover_letter"}:
+        return None
+    if tag:
+        return value_for_tag(tag, applicant)
+    return profile_value_for_label(label, applicant)
+
+
+def form_tag_requests(
+    radios: dict[str, list[dict[str, Any]]],
+    others: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Compact snapshot of the empty controls on the open form."""
+    rows: list[dict[str, Any]] = []
+
+    def add(kind: str, key: Any, payload: dict[str, Any]) -> None:
+        payload["id"] = len(rows)
+        payload["kind"] = kind
+        payload["key"] = key
+        rows.append(payload)
+
+    for name, group in radios.items():
+        if _already_checked(group):
+            continue
+        question = group[0].get("group_label") or group[0].get("label") or name
+        choices = [item.get("choice") or item.get("label") or "" for item in group]
+        add(
+            "radio",
+            name,
+            {
+                "label": _clip(str(question), 300),
+                "type": "radio",
+                "choices": [_clip(str(item), 80) for item in choices[:12]],
+                "required": any(item.get("required") for item in group),
+                "context": _clip(str(group[0].get("context") or ""), 280),
+            },
+        )
+    for index, field in enumerate(others):
+        field_type = str(field.get("type") or "")
+        if field_type in _SKIP_INPUT_TYPES:
+            continue
+        if _has_value(field):
+            continue
+        add(
+            "field",
+            index,
+            {
+                "label": _clip(str(field.get("label") or ""), 300),
+                "group": _clip(str(field.get("group_label") or ""), 200),
+                "name": _clip(str(field.get("name") or ""), 120),
+                "type": field_type,
+                "required": bool(field.get("required")),
+                "options": [_clip(str(option), 80) for option in (field.get("options") or [])[:12]],
+                "context": _clip(str(field.get("context") or ""), 280),
+            },
+        )
+    return rows[:40]
+
+
+def parse_field_tags(payload: dict[str, Any], valid_ids: set[int]) -> dict[int, str]:
+    """Keep tags the model returned for ids that are actually on the form."""
+    tags: dict[int, str] = {}
+    items = payload.get("fields") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return tags
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            field_id = int(item.get("id", item.get("index")))
+        except (TypeError, ValueError):
+            continue
+        tag = str(item.get("tag") or "").strip().lower().replace(" ", "_").replace("-", "_")
+        if field_id not in valid_ids or tag not in _FIELD_TAGS:
+            continue
+        tags[field_id] = tag
+    return tags
+
+
+_TYPED_CONTACT_TAGS = frozenset(
+    {
+        "first_name",
+        "last_name",
+        "full_name",
+        "email",
+        "phone",
+        "phone_prefix",
+        "linkedin",
+        "portfolio",
+        "city",
+        "location",
+        "school",
+        "salary",
+    }
+)
+
+_YES_NO = frozenset({"yes", "no", "y", "n", "true", "false"})
+
+
+def tag_conflict(tag: str, row: dict[str, Any]) -> str | None:
+    """Return why this tag cannot belong on this control."""
+    field_type = str(row.get("type") or "")
+    options = [str(item).strip().lower() for item in (row.get("options") or row.get("choices") or [])]
+    yes_no = bool(options) and all(item in _YES_NO or item.startswith(("yes", "no")) for item in options)
+    if tag in _TYPED_CONTACT_TAGS and field_type == "radio":
+        return "a radio group is a question, not a box you type a contact into"
+    if tag in _TYPED_CONTACT_TAGS and field_type.startswith("input:checkbox"):
+        return "a checkbox is not a box you type a contact into"
+    if tag in _TYPED_CONTACT_TAGS and field_type == "select" and yes_no:
+        return "a yes/no menu is not a contact field"
+    if tag == "cover_letter" and (field_type in {"radio", "select"} or field_type.startswith("input:checkbox")):
+        return "a cover letter is a text box"
+    if tag == "resume":
+        return "resume uploads are filled separately"
+    return None
+
+
+def _visible_fields(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    visible = []
+    for row in requests:
+        item = {
+            key: value
+            for key, value in row.items()
+            if key not in {"kind", "key", "field", "field_ref"} and value not in ("", [], None)
+        }
+        item["id"] = row["id"]
+        visible.append(item)
+    return visible
+
+
+def _conflict_notes(tags: dict[int, str], requests: list[dict[str, Any]]) -> list[str]:
+    by_id = {row["id"]: row for row in requests}
+    notes = []
+    for field_id, tag in tags.items():
+        reason = tag_conflict(tag, by_id.get(field_id) or {})
+        if reason:
+            notes.append(f"id {field_id} tagged {tag}: {reason}")
+    return notes
+
+
+def _without_conflicts(tags: dict[int, str], requests: list[dict[str, Any]]) -> dict[int, str]:
+    by_id = {row["id"]: row for row in requests}
+    return {
+        field_id: tag
+        for field_id, tag in tags.items()
+        if field_id in by_id and not tag_conflict(tag, by_id[field_id])
+    }
+
+
+def run_form_tag_agent(llm: Any, requests: list[dict[str, Any]]) -> dict[int, str]:
+    """Label the open form, check those labels, and correct them once.
+
+    An empty result means the agent failed. The caller fills from the label text.
+    """
+    if not requests:
+        return {}
+    valid_ids = {row["id"] for row in requests}
+    user = json.dumps({"fields": _visible_fields(requests)}, ensure_ascii=False)
+    payload = llm.complete_json(_TAG_SYSTEM, user, temperature=0, max_tokens=1500)
+    tags = parse_field_tags(payload, valid_ids)
+    notes = _conflict_notes(tags, requests)
+    if notes:
+        correction = (
+            user
+            + "\n\nYour previous labels:\n"
+            + json.dumps({"fields": [{"id": field_id, "tag": tag} for field_id, tag in sorted(tags.items())]})
+            + "\n\nThese labels do not fit the control. Label every id again and fix these:\n"
+            + "\n".join(f"- {note}" for note in notes)
+        )
+        payload = llm.complete_json(_TAG_SYSTEM, correction, temperature=0, max_tokens=1500)
+        tags = parse_field_tags(payload, valid_ids)
+    return _without_conflicts(tags, requests)
+
+
+def label_profile_tag(label: str) -> str | None:
+    """The contact tag a label names, when the label is a contact box."""
+    text = _label_text(label)
+    if not text:
+        return None
+    if "given name" in text or (re.search(r"\bfirst\b", text) and "name" in text):
+        return "first_name"
+    if any(token in text for token in ("surname", "family name")) or (re.search(r"\blast\b", text) and "name" in text):
+        return "last_name"
+    if _looks_like_email_field(text):
+        return "email"
+    if _looks_like_phone_prefix_field(text):
+        return "phone_prefix"
+    if text == "country":
+        return "country"
+    if "city" in text and "authorization" not in text:
+        return "city"
+    if _looks_like_phone_field(text):
+        return "phone"
+    if "linkedin" in text:
+        return "linkedin"
+    if any(token in text for token in ("portfolio", "website", "github")) or (
+        re.search(r"\burl\b", text) and "job" not in text
+    ):
+        return "portfolio"
+    if re.search(r"\blocation\b", text) and "authorization" not in text:
+        return "location"
+    if _looks_like_school_field(text):
+        return "school"
+    if text in {"name", "name *"} or re.search(r"\b(full name|your name)\b", text):
+        return "full_name"
+    if is_salary_question(label):
+        return "salary"
+    if is_work_auth_question(label):
+        return "work_authorization"
+    return None
+
+
+_PHONE_PREFIX_KEEP = frozenset({"first_name", "last_name", "full_name", "email", "resume"})
+
+
+def _is_phone_control(field: dict[str, Any]) -> bool:
+    """A phone-number box, not the calling-code box beside it."""
+    if str(field.get("tag") or "") == "phone":
+        return True
+    if str(field.get("tag") or "") == "phone_prefix":
+        return False
+    label = _label_text(str(field.get("label") or ""))
+    group = _label_text(str(field.get("group_label") or ""))
+    return _looks_like_phone_field(label) or _looks_like_phone_field(group)
+
+
+def mark_phone_prefix_before_phone(fields: list[dict[str, Any]]) -> None:
+    """The control directly before the phone number is the calling code."""
+    eligible = [
+        field
+        for field in fields
+        if str(field.get("type") or "") not in _SKIP_INPUT_TYPES
+    ]
+    for index, field in enumerate(eligible):
+        if index == 0 or not _is_phone_control(field):
+            continue
+        previous = eligible[index - 1]
+        if _is_phone_control(previous):
+            continue
+        if str(previous.get("tag") or "") in _PHONE_PREFIX_KEEP:
+            continue
+        previous["tag"] = "phone_prefix"
+
+
+def found_contact_tags(fields: list[dict[str, Any]]) -> set[str]:
+    """Contact tags already sitting on a control, by tag or by its label."""
+    found: set[str] = set()
+    for field in fields:
+        tag = str(field.get("tag") or "")
+        if tag in _HELD_TAGS:
+            found.add(tag)
+            continue
+        if tag in {"skip", "screening", "eeo", "sensitive", "agreement", "cover_letter", "resume"}:
+            continue
+        inferred = label_profile_tag(str(field.get("label") or "")) or label_profile_tag(str(field.get("group_label") or ""))
+        if inferred:
+            found.add(inferred)
+    return found
+
+
+def missing_contact_tags(found: set[str], applicant: Applicant) -> list[str]:
+    """Contact facts that have a value and no control yet."""
+    missing: list[str] = []
+    if "full_name" not in found and "first_name" not in found and value_for_tag("first_name", applicant):
+        missing.append("first_name")
+    if "full_name" not in found and "last_name" not in found and value_for_tag("last_name", applicant):
+        missing.append("last_name")
+    if "full_name" not in found and "first_name" not in found and value_for_tag("full_name", applicant):
+        missing.append("full_name")
+    for tag in (
+        "email",
+        "phone",
+        "phone_prefix",
+        "linkedin",
+        "portfolio",
+        "city",
+        "country",
+        "location",
+        "school",
+        "salary",
+        "work_authorization",
+    ):
+        if tag in found or not value_for_tag(tag, applicant):
+            continue
+        missing.append(tag)
+    return missing
+
+
+def _is_recovery_candidate(field: dict[str, Any]) -> bool:
+    tag = str(field.get("tag") or "")
+    if tag in _HELD_TAGS or tag in {"eeo", "sensitive", "agreement", "resume"}:
+        return False
+    if str(field.get("type") or "") in _SKIP_INPUT_TYPES:
+        return False
+    try:
+        if _has_value(field):
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def recovery_requests(
+    radios: dict[str, list[dict[str, Any]]],
+    others: list[dict[str, Any]],
+    extras: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Controls the first pass did not accept as a contact field."""
+    rows: list[dict[str, Any]] = []
+
+    def add(kind: str, field: dict[str, Any]) -> None:
+        if len(rows) >= 40 or not _is_recovery_candidate(field):
+            return
+        choices = field.get("options") or []
+        rows.append(
+            {
+                "id": len(rows),
+                "kind": kind,
+                "field": field,
+                "label": _clip(str(field.get("group_label") or field.get("label") or ""), 300),
+                "name": _clip(str(field.get("name") or ""), 120),
+                "type": str(field.get("type") or ""),
+                "required": bool(field.get("required")),
+                "options": [_clip(str(option), 80) for option in choices[:12]],
+                "context": _clip(str(field.get("context") or ""), 280),
+            }
+        )
+
+    for group in radios.values():
+        if not group or _already_checked(group):
+            continue
+        sample = dict(group[0])
+        sample["type"] = "radio"
+        sample["label"] = group[0].get("group_label") or group[0].get("label") or ""
+        sample["options"] = [item.get("choice") or item.get("label") or "" for item in group]
+        sample["field_ref"] = group[0]
+        before = len(rows)
+        add("radio", sample)
+        if len(rows) > before:
+            rows[-1]["field"] = group[0]
+    for field in others:
+        add("field", field)
+    for field in extras:
+        add("extra", field)
+    return rows
+
+
+def _recovery_tags(payload: dict[str, Any], valid_ids: set[int], allowed: set[str]) -> dict[int, str]:
+    tags = parse_field_tags(payload, valid_ids)
+    return {field_id: tag for field_id, tag in tags.items() if tag in allowed}
+
+
+def run_control_recovery_agent(
+    llm: Any,
+    requests: list[dict[str, Any]],
+    missing: list[str],
+) -> dict[int, str]:
+    """Pick controls for contact fields the first pass did not find.
+
+    Tags that are not missing, or that do not fit the control, are dropped.
+    """
+    allowed = set(missing)
+    if not requests or not allowed:
+        return {}
+    valid_ids = {row["id"] for row in requests}
+    user = json.dumps(
+        {"missing": missing, "fields": _visible_fields(requests)},
+        ensure_ascii=False,
+    )
+    payload = llm.complete_json(_RECOVERY_SYSTEM, user, temperature=0, max_tokens=1500)
+    tags = _recovery_tags(payload, valid_ids, allowed)
+    notes = _conflict_notes(tags, requests)
+    if notes:
+        correction = (
+            user
+            + "\n\nThese labels do not fit the control. Label every id again and fix these:\n"
+            + "\n".join(f"- {note}" for note in notes)
+        )
+        payload = llm.complete_json(_RECOVERY_SYSTEM, correction, temperature=0, max_tokens=1500)
+        tags = _recovery_tags(payload, valid_ids, allowed)
+    return _without_conflicts(tags, requests)
+
+
+_LEAVE_BLANK_TAGS = frozenset({"eeo", "sensitive", "agreement", "skip", "resume"})
+
+
+def infer_field_requests(
+    radios: dict[str, list[dict[str, Any]]],
+    others: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Empty controls that still need an answer from the profile."""
+    rows: list[dict[str, Any]] = []
+
+    def add(kind: str, key: Any, field: dict[str, Any], payload: dict[str, Any]) -> None:
+        payload["id"] = len(rows)
+        payload["kind"] = kind
+        payload["key"] = key
+        payload["field"] = field
+        rows.append(payload)
+
+    for name, group in radios.items():
+        if not group or _already_checked(group):
+            continue
+        tag = str(group[0].get("tag") or "")
+        question = str(group[0].get("group_label") or group[0].get("label") or name)
+        if tag in _LEAVE_BLANK_TAGS or _leave_blank(question):
+            continue
+        choices = [item.get("choice") or item.get("label") or "" for item in group]
+        add(
+            "radio",
+            name,
+            group[0],
+            {
+                "label": _clip(question, 300),
+                "type": "radio",
+                "options": [_clip(str(item), 80) for item in choices[:12]],
+                "required": any(item.get("required") for item in group),
+                "context": _clip(str(group[0].get("context") or ""), 280),
+            },
+        )
+    for field in others:
+        field_type = str(field.get("type") or "")
+        if field_type in _SKIP_INPUT_TYPES:
+            continue
+        try:
+            if _has_value(field):
+                continue
+        except Exception:
+            continue
+        label = str(field.get("group_label") or field.get("label") or "")
+        tag = str(field.get("tag") or "")
+        if tag in _LEAVE_BLANK_TAGS or _leave_blank(label):
+            continue
+        if re.search(r"\bfollow\b", label, re.IGNORECASE) and not field.get("required"):
+            continue
+        add(
+            "field",
+            None,
+            field,
+            {
+                "label": _clip(str(field.get("label") or ""), 300),
+                "group": _clip(str(field.get("group_label") or ""), 200),
+                "name": _clip(str(field.get("name") or ""), 120),
+                "type": field_type,
+                "required": bool(field.get("required")),
+                "options": [_clip(str(option), 80) for option in (field.get("options") or [])[:12]],
+                "context": _clip(str(field.get("context") or ""), 280),
+            },
+        )
+    rows.sort(key=lambda row: not row["required"])
+    for index, row in enumerate(rows[:30]):
+        row["id"] = index
+    return rows[:30]
+
+
+def _leave_blank(label: str) -> bool:
+    return is_eeo_question(label) or is_sensitive_question(label) or is_agreement_question(label)
+
+
+def parse_inferred_answers(payload: dict[str, Any], valid_ids: set[int]) -> dict[int, str]:
+    """Keep non-empty answers for ids that were actually sent."""
+    answers: dict[int, str] = {}
+    items = payload.get("fields") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return answers
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            field_id = int(item.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if field_id not in valid_ids:
+            continue
+        answer = " ".join(str(item.get("answer") or "").replace("\n", " ").split())
+        if answer:
+            answers[field_id] = answer
+    return answers
+
+
+def _option_mismatches(answers: dict[int, str], requests: list[dict[str, Any]]) -> list[str]:
+    by_id = {row["id"]: row for row in requests}
+    notes = []
+    for field_id, answer in answers.items():
+        options = by_id.get(field_id, {}).get("options") or []
+        if options and not _option_match(answer, options):
+            notes.append(f"id {field_id} answer {answer!r} is not one of the options")
+    return notes
+
+
+def _answers_on_options(answers: dict[int, str], requests: list[dict[str, Any]]) -> dict[int, str]:
+    by_id = {row["id"]: row for row in requests}
+    kept: dict[int, str] = {}
+    for field_id, answer in answers.items():
+        options = by_id.get(field_id, {}).get("options") or []
+        if options and not _option_match(answer, options):
+            continue
+        kept[field_id] = answer
+    return kept
+
+
+def run_profile_infer_agent(
+    llm: Any,
+    requests: list[dict[str, Any]],
+    profile_text: str,
+    cv_text: str,
+) -> dict[int, str]:
+    """Infer answers for empty fields from the profile and CV.
+
+    An answer that is not one of a field's options is sent back once, then dropped.
+    """
+    if not requests:
+        return {}
+    valid_ids = {row["id"] for row in requests}
+    user = json.dumps(
+        {
+            "profile": profile_text,
+            "cv": cv_text[:8000],
+            "fields": _visible_fields(requests),
+        },
+        ensure_ascii=False,
+    )
+    payload = llm.complete_json(_INFER_SYSTEM, user, temperature=0, max_tokens=2000)
+    answers = parse_inferred_answers(payload, valid_ids)
+    notes = _option_mismatches(answers, requests)
+    if notes:
+        correction = (
+            user
+            + "\n\nThese answers are not one of the listed options. Answer every id again and fix these:\n"
+            + "\n".join(f"- {note}" for note in notes)
+        )
+        payload = llm.complete_json(_INFER_SYSTEM, correction, temperature=0, max_tokens=2000)
+        answers = parse_inferred_answers(payload, valid_ids)
+    return _answers_on_options(answers, requests)
+
+
+def _inferred_limit(row: dict[str, Any]) -> int:
+    label = str(row.get("label") or "")
+    field_type = str(row.get("type") or "")
+    if field_type == "textarea" or re.search(r"cover letter|why (do you|are you)", label, re.IGNORECASE):
+        return 1500
+    return 500
+
+
+def apply_inferred_answers(
+    radios: dict[str, list[dict[str, Any]]],
+    requests: list[dict[str, Any]],
+    answers: dict[int, str],
+) -> set[str]:
+    """Type inferred answers. Returns the labels that accepted a value."""
+    filled: set[str] = set()
+    for row in requests:
+        answer = answers.get(row["id"])
+        if not answer:
+            continue
+        label = str(row.get("label") or "")
+        if row["kind"] == "radio":
+            group = radios.get(row["key"]) or []
+            choices = [item.get("choice") or item.get("label") or "" for item in group]
+            matched = _option_match(answer, choices)
+            if matched and _check_matching(group, matched):
+                filled.add(label)
+            continue
+        field = row["field"]
+        field_type = str(field.get("type") or "")
+        text = answer[: _inferred_limit(row)]
+        written = False
+        if field_type == "select":
+            written = _select_choice(field, text)
+        elif field_type.startswith("input:checkbox"):
+            if text.strip().lower() in {"yes", "true", "y"}:
+                written = _write(field, "yes")
+        else:
+            written = _write(field, text)
+        if written:
+            filled.add(str(field.get("label") or label))
+    return {item for item in filled if item}
+
+
+def _without_filled(unresolved: list[str], filled_labels: set[str]) -> list[str]:
+    kept = []
+    for item in unresolved:
+        if any(item == label or item.endswith(f": {label}") for label in filled_labels):
+            continue
+        kept.append(item)
+    return kept
+
+
+def assign_form_tags(
+    radios: dict[str, list[dict[str, Any]]],
+    others: list[dict[str, Any]],
+    tags_by_id: dict[int, str],
+    requests: list[dict[str, Any]],
+) -> None:
+    for row in requests:
+        tag = tags_by_id.get(row["id"])
+        if not tag:
+            continue
+        if row["kind"] == "radio":
+            for item in radios.get(row["key"], []):
+                item["tag"] = tag
+            continue
+        others[row["key"]]["tag"] = tag
+
+
+def _clip(value: str, limit: int) -> str:
+    return _clean(value)[:limit]
+
+
+def _location_parts(location: str) -> list[str]:
+    return [part.strip() for part in (location or "").split(",") if part.strip()]
+
+
+def _city_from_location(location: str) -> str | None:
+    parts = _location_parts(location)
+    return parts[0] if parts else None
+
+
+def _country_from_location(location: str) -> str | None:
+    parts = _location_parts(location)
+    if len(parts) >= 2:
+        return parts[-1]
     return None
 
 
@@ -368,18 +1249,49 @@ def _accept_apply(label: str) -> bool:
     return "apply" in text
 
 
+def _accept_easy_apply(label: str) -> bool:
+    return "easy apply" in label.lower()
+
+
 def _accept_next(label: str) -> bool:
-    text = label.lower().strip()
-    if any(bad in text for bad in ("job", "page", "result", "search")):
+    text = " ".join(label.lower().split())
+    if not text:
         return False
-    return text in {"continue", "next", "review", "save and continue"} or text.startswith("continue")
+    if any(bad in text for bad in ("next page", "previous", "search jobs", "job alert", "see more jobs")):
+        return False
+    if any(phrase in text for phrase in ("save and continue", "next step", "review your application", "continue applying")):
+        return True
+    return text.split()[0] in {"continue", "next", "review"}
 
 
 def _accept_submit(label: str) -> bool:
-    text = label.lower().strip()
-    if "search" in text or not text:
+    text = " ".join(label.lower().split())
+    if not text or "search" in text or "submitted" in text:
         return False
     return "submit" in text or "send application" in text
+
+
+def _control_label(element: Any) -> str:
+    parts: list[str] = []
+    for attr in ("aria-label", "value"):
+        try:
+            parts.append(element.get_attribute(attr) or "")
+        except Exception:
+            continue
+    try:
+        parts.append(element.inner_text(timeout=500))
+    except Exception:
+        pass
+    return _clean(" ".join(parts))
+
+
+def _is_disabled(element: Any) -> bool:
+    try:
+        if element.get_attribute("disabled") is not None:
+            return True
+        return str(element.get_attribute("aria-disabled")).lower() == "true"
+    except Exception:
+        return False
 
 
 class JobApplier:
@@ -395,6 +1307,8 @@ class JobApplier:
         self.log = log
         self.console = console or Console()
         self.headless = settings.headless
+        self._progress: Any = None
+        self._linkedin_login_skipped = False
 
     def run(
         self,
@@ -440,6 +1354,7 @@ class JobApplier:
                     ) from exc
                 raise
             page = context.pages[0] if context.pages else context.new_page()
+            page.on("dialog", _accept_browser_dialog)
             eligible = 0
             try:
                 with Progress(
@@ -449,6 +1364,7 @@ class JobApplier:
                     MofNCompleteColumn(),
                     console=self.console,
                 ) as progress:
+                    self._progress = progress
                     for role in roles:
                         if eligible >= limit:
                             break
@@ -494,6 +1410,7 @@ class JobApplier:
                                 if record.status != "dry_run":
                                     self._sleep_between()
             finally:
+                self._progress = None
                 context.close()
         return outcomes
 
@@ -542,6 +1459,47 @@ class JobApplier:
         threshold: int,
     ) -> ApplicationRecord:
         try:
+            return self._run_one_job(
+                page,
+                job,
+                role,
+                applicant,
+                cv_text,
+                pdf_path,
+                dry_run=dry_run,
+                auto_submit=auto_submit,
+                threshold=threshold,
+            )
+        except _JobTimeLimit:
+            self.console.print("[yellow]Stuck for 5 minutes without the button. Trying the next job.[/yellow]")
+            try:
+                self._discard_easy_apply(page)
+            except Exception:
+                pass
+            return _record(
+                job,
+                role,
+                None,
+                "skipped_manual",
+                "Stuck for 5 minutes without the button. Trying the next job.",
+                job.title or "Unknown role",
+                job.company or "Unknown",
+            )
+
+    def _run_one_job(
+        self,
+        page: Any,
+        job: JobPosting,
+        role: ManifestRole,
+        applicant: Applicant,
+        cv_text: str,
+        pdf_path: Path,
+        *,
+        dry_run: bool,
+        auto_submit: bool,
+        threshold: int,
+    ) -> ApplicationRecord:
+        try:
             page.goto(job.url, wait_until="domcontentloaded", timeout=45000)
             self._sleep_short()
             self._pause_if_needed(page)
@@ -553,6 +1511,8 @@ class JobApplier:
             if len(description.strip()) < 80:
                 return _record(job, role, None, "error", "Could not read a job description from the page.", title, company)
             fit = self._score(cv_text, role, description)
+        except _JobTimeLimit:
+            raise
         except (LLMError, CVError) as exc:
             return _record(job, role, None, "error", str(exc))
         except Exception as exc:
@@ -570,52 +1530,75 @@ class JobApplier:
         opened_popup = False
         keep_open = False
         try:
+            if _is_linkedin_job(page, job):
+                linkedin_result = self._apply_on_linkedin(
+                    page,
+                    job,
+                    role,
+                    applicant,
+                    cv_text,
+                    pdf_path,
+                    auto_submit=auto_submit,
+                    score=fit.score,
+                    notes=notes,
+                    title=title,
+                    company=company,
+                )
+                if linkedin_result is not None:
+                    return linkedin_result
             form_page, opened_popup = self._open_application(page)
+            root = form_page
+            if _may_have_greenhouse_form(form_page, job):
+                root = _wait_for_application_root(form_page) or form_page
+                try:
+                    root.locator(".application--questions").first.scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
             self._pause_if_needed(form_page)
             uploaded = False
             for _step in range(6):
                 self._pause_if_needed(form_page)
                 if not uploaded:
-                    uploaded = self._upload_cv(form_page, pdf_path)
-                reason = self._fill_step(form_page, applicant, cv_text, role)
+                    uploaded = self._upload_cv(root, pdf_path)
+                reason = self._fill_step(root, applicant, cv_text, role)
                 if reason:
                     action = self._wait(reason, allow_submit=False)
                     if action == "skip":
                         return _record(job, role, fit.score, "skipped_manual", reason[:500], title, company)
-                    self._fill_step(form_page, applicant, cv_text, role)
-                if self._click_first(form_page, NEXT_SELECTORS, _accept_next):
+                    self._fill_step(root, applicant, cv_text, role)
+                if self._click_first(root, NEXT_SELECTORS, _accept_next):
                     self._sleep_short()
-                    form_page.wait_for_timeout(600)
+                    root.wait_for_timeout(600)
                     continue
                 break
 
-            if not auto_submit:
-                action = self._wait(
-                    "Review the filled form in the browser. Type submit to send it, or skip to leave it.",
-                    allow_submit=True,
-                )
-                if action != "submit":
-                    keep_open = True
-                    return _record(job, role, fit.score, "pending_review", "Waiting for manual submit.", title, company)
-            elif self._unfilled_required(form_page):
-                action = self._wait(
-                    "Some required fields are still empty. Fill them, type submit, or skip.",
-                    allow_submit=True,
-                )
-                if action == "skip":
-                    return _record(job, role, fit.score, "skipped_manual", "Required fields left empty.", title, company)
-                if action != "submit":
-                    keep_open = True
-                    return _record(job, role, fit.score, "pending_review", "Auto-submit stopped on an incomplete form.", title, company)
+            action = self._confirm_submit(
+                "The form is filled. Fix any missing fields in the browser, then type submit. Type skip to leave it.",
+                auto_submit=auto_submit,
+                incomplete=self._unfilled_required(root),
+            )
+            if action == "skip":
+                return _record(job, role, fit.score, "skipped_manual", "Left for you before submit.", title, company)
+            if action is not None and action != "submit":
+                keep_open = True
+                return _record(job, role, fit.score, "pending_review", "Waiting for manual submit.", title, company)
 
-            if self._click_first(form_page, SUBMIT_SELECTORS, _accept_submit):
+            if self._click_first(root, SUBMIT_SELECTORS, _accept_submit):
                 self._sleep_short()
                 return _record(job, role, fit.score, "submitted", notes[:500], title, company)
-            action = self._wait("The submit button was not found. Submit it yourself, or type skip.", allow_submit=True)
-            if action == "submit" and self._click_first(form_page, SUBMIT_SELECTORS, _accept_submit):
+            action = self._wait(
+                "The submit button was not found. Submit it yourself, or type skip.",
+                allow_submit=True,
+                stuck=True,
+            )
+            if action == "submit" and self._click_first(root, SUBMIT_SELECTORS, _accept_submit):
                 return _record(job, role, fit.score, "submitted", notes[:500], title, company)
+            if action == "skip":
+                return _record(job, role, fit.score, "skipped_manual", "Submit was not found, so this job was skipped.", title, company)
             keep_open = True
             return _record(job, role, fit.score, "pending_review", "Form filled. Submit was not clicked.", title, company)
+        except _JobTimeLimit:
+            raise
         except ConfigError:
             raise
         except Exception as exc:
@@ -745,8 +1728,215 @@ class JobApplier:
         self._sleep_short()
         return page, False
 
-    def _fill_step(self, page: Any, applicant: Applicant, cv_text: str, role: ManifestRole) -> str:
-        fields = _extract_fields(page)
+    def _apply_on_linkedin(
+        self,
+        page: Any,
+        job: JobPosting,
+        role: ManifestRole,
+        applicant: Applicant,
+        cv_text: str,
+        pdf_path: Path,
+        *,
+        auto_submit: bool,
+        score: float,
+        notes: str,
+        title: str,
+        company: str,
+    ) -> ApplicationRecord | None:
+        """Fill LinkedIn Easy Apply. External Apply buttons fall through to the generic form filler."""
+        if not self._ensure_linkedin_session(page, job.url):
+            return _record(job, role, score, "error", "LinkedIn is still asking you to sign in.", title, company)
+        self._dismiss_linkedin_cookies(page)
+        self._wait_for_linkedin_apply(page)
+        if not self._has_control(page, LINKEDIN_EASY_APPLY_SELECTORS, _accept_easy_apply):
+            return None
+        if not self._open_easy_apply(page):
+            if _linkedin_needs_login(page) and self._ensure_linkedin_session(page, job.url):
+                self._open_easy_apply(page)
+            if _linkedin_modal(page) is None:
+                return _record(
+                    job,
+                    role,
+                    score,
+                    "error",
+                    "Easy Apply did not open, so this job was left unsubmitted.",
+                    title,
+                    company,
+                )
+        self.console.print("[green]Easy Apply opened[/green]")
+        uploaded = False
+        prompted_for_step = False
+        for _step in range(8):
+            self._pause_if_needed(page)
+            self._click_continue_applying(page)
+            modal = _linkedin_modal(page)
+            if modal is None:
+                if _linkedin_application_sent(page):
+                    return _record(job, role, score, "submitted", notes[:500], title, company)
+                break
+            if not uploaded:
+                _reveal_resume_upload(modal)
+                uploaded = self._upload_cv(page, pdf_path, modal)
+            reason = self._fill_step(page, applicant, cv_text, role, modal)
+            if reason:
+                action = self._wait(reason, allow_submit=False)
+                if action == "skip":
+                    self._discard_easy_apply(page)
+                    return _record(job, role, score, "skipped_manual", reason[:500], title, company)
+                self._fill_step(page, applicant, cv_text, role, modal)
+            submit_ready = self._has_control(page, LINKEDIN_SUBMIT_SELECTORS, _accept_submit)
+            next_ready = self._has_control(page, LINKEDIN_NEXT_SELECTORS, _accept_next)
+            if submit_ready and not next_ready:
+                action = self._confirm_submit(
+                    "The LinkedIn form is filled. Fix any missing fields in the browser, then type submit. Type skip to leave it.",
+                    auto_submit=auto_submit,
+                    incomplete=self._unfilled_required(page, modal),
+                )
+                if action == "skip":
+                    self._discard_easy_apply(page)
+                    return _record(job, role, score, "skipped_manual", "Skipped the LinkedIn application.", title, company)
+                if action is not None and action != "submit":
+                    return _record(job, role, score, "pending_review", "Left the LinkedIn application for you.", title, company)
+                if self._click_first(page, LINKEDIN_SUBMIT_SELECTORS, _accept_submit):
+                    try:
+                        page.wait_for_timeout(1500)
+                    except Exception:
+                        pass
+                    if _linkedin_application_sent(page) or _linkedin_modal(page) is None:
+                        return _record(job, role, score, "submitted", notes[:500], title, company)
+                    if _linkedin_form_error(page):
+                        continue
+                    try:
+                        page.wait_for_timeout(1200)
+                    except Exception:
+                        pass
+                    if _linkedin_application_sent(page) or _linkedin_modal(page) is None:
+                        return _record(job, role, score, "submitted", notes[:500], title, company)
+                break
+            if self._click_first(page, LINKEDIN_NEXT_SELECTORS, _accept_next):
+                self.console.print("[dim]LinkedIn application: next step[/dim]")
+                try:
+                    page.wait_for_timeout(800)
+                except Exception:
+                    pass
+                continue
+            if not prompted_for_step:
+                prompted_for_step = True
+                action = self._wait(
+                    "LinkedIn's Next button is disabled or missing. Fill the highlighted fields in the browser, then press Enter. Type skip to move on.",
+                    allow_submit=False,
+                    stuck=True,
+                )
+                if action == "skip":
+                    self._discard_easy_apply(page)
+                    return _record(job, role, score, "skipped_manual", "Skipped a LinkedIn step that could not advance.", title, company)
+                continue
+            break
+        if _linkedin_application_sent(page):
+            return _record(job, role, score, "submitted", notes[:500], title, company)
+        self._discard_easy_apply(page)
+        return _record(
+            job,
+            role,
+            score,
+            "error",
+            "LinkedIn Easy Apply did not reach Submit. This job was left unsubmitted.",
+            title,
+            company,
+        )
+
+    def _ensure_linkedin_session(self, page: Any, job_url: str) -> bool:
+        if not _linkedin_needs_login(page):
+            return True
+        if self._linkedin_login_skipped:
+            return False
+        action = self._wait(
+            "LinkedIn needs you to sign in. Log in in the browser window, then press Enter. The session is reused next time. Type skip to pass over LinkedIn jobs for this run.",
+            allow_submit=False,
+        )
+        if action == "skip":
+            self._linkedin_login_skipped = True
+            return False
+        try:
+            page.goto(job_url, wait_until="domcontentloaded", timeout=45000)
+            self._sleep_short()
+        except Exception:
+            return False
+        return not _linkedin_needs_login(page)
+
+    def _dismiss_linkedin_cookies(self, page: Any) -> None:
+        self._click_first(
+            page,
+            [
+                "button[action-type='ACCEPT']",
+                "button.artdeco-global-alert__action",
+            ],
+            lambda label: "accept" in label.lower() and "terms" not in label.lower(),
+        )
+
+    def _wait_for_linkedin_apply(self, page: Any) -> None:
+        try:
+            page.locator(
+                ".jobs-apply-button--top-card, button.jobs-apply-button, button[aria-label*='Easy Apply'], a[aria-label*='Easy Apply'], a:has-text('Apply')"
+            ).first.wait_for(state="visible", timeout=10000)
+        except Exception:
+            pass
+
+    def _open_easy_apply(self, page: Any) -> bool:
+        if not self._click_first(page, LINKEDIN_EASY_APPLY_SELECTORS, _accept_easy_apply):
+            return False
+        try:
+            page.locator(", ".join(LINKEDIN_MODAL_SELECTORS)).first.wait_for(state="visible", timeout=8000)
+        except Exception:
+            return _linkedin_modal(page) is not None
+        try:
+            page.wait_for_timeout(500)
+        except Exception:
+            pass
+        return True
+
+    def _click_continue_applying(self, page: Any) -> None:
+        self._click_first(
+            page,
+            ["button[aria-label='Continue applying']", "button:has-text('Continue applying')"],
+            lambda label: "continue applying" in label.lower(),
+        )
+
+    def _discard_easy_apply(self, page: Any) -> None:
+        if _linkedin_modal(page) is None:
+            return
+        self._click_first(
+            page,
+            [
+                ".jobs-easy-apply-modal button[aria-label='Dismiss']",
+                ".jobs-easy-apply-content button[aria-label='Dismiss']",
+                "button[aria-label='Dismiss']",
+            ],
+            lambda label: "dismiss" in label.lower(),
+        )
+        try:
+            page.wait_for_timeout(400)
+        except Exception:
+            pass
+        self._click_first(
+            page,
+            ["button[data-control-name='discard_application_confirm_btn']", "button:has-text('Discard')"],
+            lambda label: "discard" in label.lower(),
+        )
+
+    def _fill_step(
+        self,
+        page: Any,
+        applicant: Applicant,
+        cv_text: str,
+        role: ManifestRole,
+        root: Any = None,
+    ) -> str:
+        school = _school_from_role(role, self.settings)
+        if school and school != applicant.school:
+            applicant = applicant.model_copy(update={"school": school})
+        _fill_name_ids(root or page, applicant)
+        fields = _extract_fields(root or page, page)
         radios: dict[str, list[dict[str, Any]]] = {}
         others: list[dict[str, Any]] = []
         for field in fields:
@@ -757,11 +1947,22 @@ class JobApplier:
 
         unresolved: list[str] = []
         llm_calls = 0
+        self._identify_form_tags(radios, others)
+        self._recover_missing_controls(root or page, page, radios, others, applicant)
+        mark_phone_prefix_before_phone(others)
         for name, group in radios.items():
             question = group[0]["group_label"] or group[0]["label"] or name
             labels = [item["choice"] or item["label"] for item in group]
             required = any(item["required"] for item in group)
             if _already_checked(group):
+                continue
+            tag = group[0].get("tag")
+            if tag in {"skip", "resume"}:
+                continue
+            if tag:
+                choice = self._choice_for_tag(tag, question, labels, applicant, cv_text, required, unresolved)
+                if choice:
+                    _check_matching(group, choice)
                 continue
             choice = self._choose_option(question, labels, applicant, cv_text, required, unresolved)
             if choice:
@@ -777,6 +1978,12 @@ class JobApplier:
                 continue
             if _has_value(field):
                 continue
+            tag = field.get("tag")
+            if tag:
+                llm_calls = self._fill_tagged(field, tag, applicant, cv_text, unresolved, llm_calls)
+                continue
+            if re.search(r"\bfollow\b", label, re.IGNORECASE) and not required:
+                continue
             if is_eeo_question(label):
                 if required:
                     unresolved.append(f"Voluntary question left blank: {label}")
@@ -787,6 +1994,14 @@ class JobApplier:
             if is_agreement_question(label):
                 if required:
                     unresolved.append(f"Confirm this agreement yourself: {label}")
+                continue
+            if field_type.startswith("input:checkbox"):
+                country = (_country_from_location(applicant.location) or "").lower()
+                choice = (field.get("choice") or label).strip(" *").lower()
+                if country and (choice == country or choice.startswith(country)):
+                    _write(field, "yes")
+                elif required and ("?" in label or len(label) > 40):
+                    unresolved.append(label)
                 continue
             if is_salary_question(label):
                 if applicant.salary_expectation and field_type != "select":
@@ -814,7 +2029,8 @@ class JobApplier:
             if profile_value and field_type != "select":
                 if field_type.startswith("input:checkbox"):
                     continue
-                _write(field, profile_value)
+                if not _write(field, profile_value) and required:
+                    unresolved.append(label)
                 continue
             if field_type == "select" and profile_value and _select_choice(field, profile_value):
                 continue
@@ -849,6 +2065,9 @@ class JobApplier:
             else:
                 _write(field, answer.answer)
 
+        filled_labels = self._infer_empty_fields(radios, others, applicant, cv_text)
+        unresolved = _without_filled(unresolved, filled_labels)
+
         unique: list[str] = []
         for item in unresolved:
             if item not in unique:
@@ -857,6 +2076,274 @@ class JobApplier:
             return ""
         preview = "; ".join(unique[:3])
         return "These fields need you in the browser: " + preview
+
+    def _infer_empty_fields(
+        self,
+        radios: dict[str, list[dict[str, Any]]],
+        others: list[dict[str, Any]],
+        applicant: Applicant,
+        cv_text: str,
+    ) -> set[str]:
+        """Fill controls the profile tags did not cover, using the profile and CV."""
+        requests = infer_field_requests(radios, others)
+        if not requests:
+            return set()
+        self.console.print(f"[dim]Inferring {len(requests)} empty fields from the profile[/dim]")
+        try:
+            answers = run_profile_infer_agent(
+                self.llm,
+                requests,
+                _applicant_block(applicant),
+                cv_text,
+            )
+        except LLMError as exc:
+            self.console.print(f"[yellow]Could not infer the empty fields ({exc}).[/yellow]")
+            return set()
+        filled = apply_inferred_answers(radios, requests, answers)
+        if filled:
+            self.console.print(f"[dim]Filled {len(filled)} fields from the profile[/dim]")
+        return filled
+
+    def _identify_form_tags(self, radios: dict[str, list[dict[str, Any]]], others: list[dict[str, Any]]) -> None:
+        """Run the form agent. A failed run leaves controls unlabeled for label matching."""
+        requests = form_tag_requests(radios, others)
+        if not requests:
+            return
+        try:
+            tags = run_form_tag_agent(self.llm, requests)
+        except LLMError as exc:
+            self.console.print(f"[yellow]The form agent failed ({exc}). Matching labels directly.[/yellow]")
+            return
+        if not tags:
+            self.console.print("[yellow]The form agent did not label this form. Matching labels directly.[/yellow]")
+            return
+        assign_form_tags(radios, others, tags, requests)
+        self.console.print(f"[dim]Form agent labeled {len(tags)} fields[/dim]")
+
+    def _recover_missing_controls(
+        self,
+        scope: Any,
+        page: Any,
+        radios: dict[str, list[dict[str, Any]]],
+        others: list[dict[str, Any]],
+        applicant: Applicant,
+    ) -> None:
+        """When name, email, or phone is not on the controls already found, ask an agent to pick them."""
+        known = [item for group in radios.values() for item in group] + others
+        missing = missing_contact_tags(found_contact_tags(known), applicant)
+        if not any(tag in _CORE_CONTACT_TAGS for tag in missing):
+            return
+        extras = _extract_extra_controls(scope, page)
+        requests = recovery_requests(radios, others, extras)
+        if not requests:
+            return
+        listed = ", ".join(missing)
+        self.console.print(f"[dim]Looking for missing fields: {listed}[/dim]")
+        try:
+            tags = run_control_recovery_agent(self.llm, requests, missing)
+        except LLMError as exc:
+            self.console.print(f"[yellow]Could not find the missing fields ({exc}).[/yellow]")
+            return
+        if not tags:
+            self.console.print("[yellow]The agent could not find those fields on the other controls.[/yellow]")
+            return
+        for row in requests:
+            tag = tags.get(row["id"])
+            if not tag:
+                continue
+            field = row["field"]
+            field["tag"] = tag
+            if row["kind"] == "extra":
+                others.append(field)
+        self.console.print(f"[dim]Found {len(tags)} missing fields on other controls[/dim]")
+
+    def _choice_for_tag(
+        self,
+        tag: str,
+        question: str,
+        options: list[str],
+        applicant: Applicant,
+        cv_text: str,
+        required: bool,
+        unresolved: list[str],
+    ) -> str | None:
+        if tag == "eeo":
+            if required:
+                unresolved.append(f"Voluntary question left blank: {question}")
+            return None
+        if tag == "sensitive":
+            unresolved.append(f"Sensitive field left for you: {question}")
+            return None
+        if tag == "agreement":
+            if required:
+                unresolved.append(f"Confirm this agreement yourself: {question}")
+            return None
+        if tag == "work_authorization":
+            choice = yes_no_answer(question, applicant.work_authorization)
+            matched = _option_match(choice, options) if choice else None
+            if matched:
+                return matched
+            if required:
+                unresolved.append(f"Work authorization needs a manual answer: {question}")
+            return None
+        if tag in _PROFILE_TAGS:
+            value = value_for_tag(tag, applicant)
+            matched = _option_match(value, options) if value else None
+            if matched:
+                return matched
+            if required:
+                unresolved.append(question)
+            return None
+        if tag in {"screening", "cover_letter"}:
+            try:
+                answer = self._answer(question, cv_text, applicant, options, 80)
+            except LLMError:
+                if required:
+                    unresolved.append(question)
+                return None
+            if answer.needs_review or not answer.answer:
+                if required:
+                    unresolved.append(question)
+                return None
+            return _option_match(answer.answer, options)
+        return None
+
+    def _fill_tagged(
+        self,
+        field: dict[str, Any],
+        tag: str,
+        applicant: Applicant,
+        cv_text: str,
+        unresolved: list[str],
+        llm_calls: int,
+    ) -> int:
+        """Type into one control using the tag from the live form. Returns the LLM call count."""
+        label = field["label"]
+        required = field["required"]
+        field_type = field["type"]
+        question = field.get("group_label") or label
+
+        if tag in {"skip", "resume"}:
+            return llm_calls
+        if tag == "eeo":
+            if required:
+                unresolved.append(f"Voluntary question left blank: {label}")
+            return llm_calls
+        if tag == "sensitive":
+            unresolved.append(f"Sensitive field left for you: {label}")
+            return llm_calls
+        if tag == "agreement":
+            if required:
+                unresolved.append(f"Confirm this agreement yourself: {label}")
+            return llm_calls
+        if tag == "salary":
+            if field_type == "select" and applicant.salary_expectation and _select_choice(field, applicant.salary_expectation):
+                return llm_calls
+            if applicant.salary_expectation and field_type != "select":
+                _write(field, applicant.salary_expectation)
+            elif required:
+                unresolved.append(f"Salary was not found in the CV: {label}")
+            return llm_calls
+        if tag == "work_authorization":
+            if field_type == "select" or field_type.startswith("input:checkbox"):
+                choice = yes_no_answer(question, applicant.work_authorization)
+                if field_type == "select" and choice and _select_choice(field, choice):
+                    return llm_calls
+                if field_type.startswith("input:checkbox") and choice == "Yes":
+                    _write(field, "yes")
+                    return llm_calls
+                if required:
+                    unresolved.append(f"Work authorization needs a manual answer: {label}")
+                return llm_calls
+            if applicant.work_authorization:
+                _write(field, applicant.work_authorization)
+                return llm_calls
+            if required:
+                unresolved.append(f"Work authorization was not found in the CV: {label}")
+            return llm_calls
+        if tag == "phone_prefix" and field_type == "select":
+            country = _country_from_location(applicant.location) or ""
+            if applicant.phone_prefix and _select_phone_prefix(field, applicant.phone_prefix, country):
+                return llm_calls
+            if required:
+                unresolved.append(label)
+            return llm_calls
+        if tag in _PROFILE_TAGS:
+            value = value_for_tag(tag, applicant)
+            if field_type == "select":
+                if value and _select_choice(field, value):
+                    return llm_calls
+                if required:
+                    unresolved.append(label)
+                return llm_calls
+            if field_type.startswith("input:checkbox"):
+                if tag == "country":
+                    country = (_country_from_location(applicant.location) or "").lower()
+                    choice = (field.get("choice") or label).strip(" *").lower()
+                    if country and (choice == country or choice.startswith(country)):
+                        _write(field, "yes")
+                return llm_calls
+            if value:
+                if not _write(field, value) and required:
+                    unresolved.append(label)
+                return llm_calls
+            if required:
+                unresolved.append(label)
+            return llm_calls
+        if tag in {"screening", "cover_letter"}:
+            return self._answer_and_write(
+                field,
+                applicant,
+                cv_text,
+                unresolved,
+                llm_calls,
+                cover=tag == "cover_letter",
+            )
+        return llm_calls
+
+    def _answer_and_write(
+        self,
+        field: dict[str, Any],
+        applicant: Applicant,
+        cv_text: str,
+        unresolved: list[str],
+        llm_calls: int,
+        *,
+        cover: bool,
+    ) -> int:
+        label = field["label"]
+        required = field["required"]
+        field_type = field["type"]
+        question_like = cover or "?" in label or len(label) > 24 or field_type == "textarea"
+        if not required and not question_like:
+            return llm_calls
+        if llm_calls >= 8:
+            if required:
+                unresolved.append(label)
+            return llm_calls
+        options = field["options"] if field_type == "select" else []
+        limit = 1500 if cover or re.search(r"cover letter|why (do you|are you)", label, re.IGNORECASE) else 500
+        try:
+            answer = self._answer(label, cv_text, applicant, options, limit)
+        except LLMError as exc:
+            unresolved.append(f"{label} ({exc})")
+            return llm_calls
+        llm_calls += 1
+        if answer.needs_review or not answer.answer:
+            if required:
+                unresolved.append(label)
+            return llm_calls
+        if field_type == "select":
+            if not _select_choice(field, answer.answer) and required:
+                unresolved.append(label)
+        elif field_type.startswith("input:checkbox"):
+            if answer.answer.strip().lower() in {"yes", "true", "y"}:
+                _write(field, "yes")
+            elif required:
+                unresolved.append(label)
+        else:
+            _write(field, answer.answer)
+        return llm_calls
 
     def _choose_option(
         self,
@@ -897,9 +2384,10 @@ class JobApplier:
             return None
         return _option_match(answer.answer, options)
 
-    def _upload_cv(self, page: Any, pdf_path: Path) -> bool:
+    def _upload_cv(self, page: Any, pdf_path: Path, root: Any = None) -> bool:
+        scope = _questions_scope(root or page)
         try:
-            inputs = page.locator("input[type='file']")
+            inputs = scope.locator("input[type='file']")
             count = inputs.count()
         except Exception:
             return False
@@ -909,7 +2397,8 @@ class JobApplier:
             try:
                 label = _label_for(page, handle).lower()
                 name = (handle.get_attribute("name") or "").lower()
-                blob = f"{label} {name}"
+                field_id = (handle.get_attribute("id") or "").lower()
+                blob = f"{label} {name} {field_id}"
                 if "cover" in blob and "resume" not in blob and "cv" not in blob:
                     continue
                 handle.set_input_files(str(pdf_path))
@@ -920,26 +2409,31 @@ class JobApplier:
             self.console.print(f"[green]Uploaded[/green] {pdf_path.name}")
         return uploaded
 
+    def _has_control(self, page: Any, selectors: list[str], accept) -> bool:
+        return _matching_control(page, selectors, accept) is not None
+
     def _click_first(self, page: Any, selectors: list[str], accept) -> bool:
-        for selector in selectors:
+        for element in _iter_controls(page, selectors, accept):
             try:
-                loc = page.locator(selector)
-                count = min(loc.count(), 6)
+                element.scroll_into_view_if_needed(timeout=1000)
+            except Exception:
+                pass
+            try:
+                element.click(timeout=2500)
+                return True
             except Exception:
                 continue
-            for index in range(count):
-                element = loc.nth(index)
-                try:
-                    if not element.is_visible():
-                        continue
-                    label = _clean(element.get_attribute("value") or "") or _clean(element.inner_text(timeout=500))
-                    if not accept(label):
-                        continue
-                    element.click(timeout=2000)
-                    return True
-                except Exception:
-                    continue
         return False
+
+    def _confirm_submit(self, message: str, *, auto_submit: bool, incomplete: bool) -> str | None:
+        """Wait before Submit so a person can fix empty fields.
+
+        Returns None only for an unattended ``--auto-submit`` run whose required
+        fields are already filled. That run clicks Submit without a prompt.
+        """
+        if sys.stdin.isatty() or not auto_submit or incomplete:
+            return self._wait(message, allow_submit=True)
+        return None
 
     def _pause_if_needed(self, page: Any) -> None:
         reason = _page_needs_human(page)
@@ -948,18 +2442,32 @@ class JobApplier:
                 reason += " Re-run without --headless so the browser is visible."
             self._wait(reason, allow_submit=False)
 
-    def _wait(self, reason: str, allow_submit: bool) -> str:
-        self.console.print(Panel(reason, title="Action needed", border_style="yellow"))
-        if not sys.stdin.isatty():
-            raise ConfigError("This step needs a person at the terminal. Re-run in an interactive terminal.")
-        hint = "Press Enter to continue, or type skip: "
-        if allow_submit:
-            hint = "Type submit to send, skip to leave it, or Enter to keep reviewing: "
-        answer = self.console.input(hint).strip().lower()
-        return answer
+    def _wait(self, reason: str, allow_submit: bool, *, stuck: bool = False) -> str:
+        progress = self._progress
+        if progress is not None:
+            progress.stop()
+        try:
+            self.console.print(Panel(reason, title="Action needed", border_style="yellow"))
+            if not sys.stdin.isatty():
+                if stuck:
+                    raise _JobTimeLimit()
+                raise ConfigError("This step needs a person at the terminal. Re-run in an interactive terminal.")
+            hint = "Press Enter to continue, or type skip: "
+            if allow_submit:
+                hint = "Type submit to send, skip to leave it, or Enter to keep reviewing: "
+            if not stuck:
+                return self.console.input(hint).strip().lower()
+            self.console.print(f"{hint}[dim]{JOB_LIMIT_SECONDS}s before this stuck step is skipped.[/dim]")
+            answer = _read_stdin(JOB_LIMIT_SECONDS)
+            if answer is None:
+                raise _JobTimeLimit()
+            return answer.strip().lower()
+        finally:
+            if progress is not None:
+                progress.start()
 
-    def _unfilled_required(self, page: Any) -> bool:
-        for field in _extract_fields(page):
+    def _unfilled_required(self, page: Any, root: Any = None) -> bool:
+        for field in _extract_fields(root or page, page):
             if field["required"] and not _has_value(field) and field["type"] not in {"input:hidden", "input:file"}:
                 return True
         return False
@@ -1024,6 +2532,116 @@ def _collect_links(page: Any, board: str, cap: int) -> list[str]:
     return found
 
 
+def _accept_browser_dialog(dialog: Any) -> None:
+    try:
+        dialog.accept()
+    except Exception:
+        pass
+
+
+def _is_linkedin_job(page: Any, job: JobPosting) -> bool:
+    if job.board == "linkedin":
+        return True
+    return "linkedin.com" in f"{getattr(page, 'url', '')} {job.url}".lower()
+
+
+def _iter_controls(page: Any, selectors: list[str], accept, limit: int = 15):
+    for selector in selectors:
+        try:
+            loc = page.locator(selector)
+            count = min(loc.count(), limit)
+        except Exception:
+            continue
+        for index in range(count):
+            element = loc.nth(index)
+            try:
+                if not element.is_visible() or _is_disabled(element):
+                    continue
+                if not accept(_control_label(element)):
+                    continue
+            except Exception:
+                continue
+            yield element
+
+
+def _matching_control(page: Any, selectors: list[str], accept):
+    return next(_iter_controls(page, selectors, accept), None)
+
+
+def _linkedin_modal(page: Any):
+    for selector in LINKEDIN_MODAL_SELECTORS:
+        try:
+            loc = page.locator(selector).first
+            if loc.count() > 0 and loc.is_visible():
+                return loc
+        except Exception:
+            continue
+    return None
+
+
+def _linkedin_needs_login(page: Any) -> bool:
+    url = (getattr(page, "url", "") or "").lower()
+    if any(part in url for part in ("/login", "/uas/login", "/checkpoint/", "/authwall", "signin")):
+        return True
+    try:
+        field = page.locator("input[type='password']").first
+        if field.count() > 0 and field.is_visible():
+            return True
+    except Exception:
+        pass
+    return _linkedin_login_wall(page)
+
+
+def _linkedin_application_sent(page: Any) -> bool:
+    try:
+        text = page.inner_text("body", timeout=2000).lower()
+    except Exception:
+        text = ""
+    if any(
+        marker in text
+        for marker in (
+            "application was sent",
+            "application has been sent",
+            "application sent",
+            "application submitted",
+            "application was submitted",
+        )
+    ):
+        return True
+    for selector in (
+        "button[aria-label^='Applied']",
+        ".jobs-apply-button:has-text('Applied')",
+        ".jobs-easy-apply-modal button:has-text('Done')",
+    ):
+        try:
+            loc = page.locator(selector).first
+            if loc.count() > 0 and loc.is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _linkedin_form_error(page: Any) -> bool:
+    modal = _linkedin_modal(page)
+    if modal is None:
+        return False
+    try:
+        err = modal.locator(".artdeco-inline-feedback--error")
+        return err.count() > 0 and err.first.is_visible()
+    except Exception:
+        return False
+
+
+def _reveal_resume_upload(modal: Any) -> None:
+    try:
+        toggle = modal.locator("label:has-text('Upload resume'), span:has-text('Upload resume')").first
+        if toggle.count() > 0 and toggle.is_visible():
+            toggle.click(timeout=1500)
+    except Exception:
+        pass
+
+
 def _linkedin_login_wall(page: Any) -> bool:
     if "linkedin.com" not in (page.url or ""):
         return False
@@ -1049,6 +2667,22 @@ def _jobs_from_file(path: Path, role: ManifestRole) -> list[JobPosting]:
         seen.add(url)
         jobs.append(JobPosting(title=role.title, company="", url=url, description="", board="urls"))
     return jobs
+
+
+def _school_from_role(role: ManifestRole, settings: Settings) -> str:
+    """The first school on the tailored CV JSON for the role being applied."""
+    if not role.metadata_path:
+        return ""
+    path = settings.resolve(role.metadata_path)
+    if not path.is_file():
+        return ""
+    try:
+        cv = TailoredCV.model_validate_json(path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not cv.education:
+        return ""
+    return (cv.education[0].school or "").strip()
 
 
 def _role_context(role: ManifestRole, settings: Settings) -> str:
@@ -1129,10 +2763,124 @@ def _page_needs_human(page: Any) -> str | None:
     return None
 
 
-def _extract_fields(page: Any) -> list[dict[str, Any]]:
+def _may_have_greenhouse_form(page: Any, job: JobPosting) -> bool:
+    blob = f"{job.board} {job.url} {getattr(page, 'url', '')}".lower()
+    return "greenhouse" in blob or "gh_jid" in blob
+
+
+def _wait_for_application_root(page: Any, timeout_s: float = 12.0):
+    """Return the page or frame that contains Greenhouse's question form."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        for scope in _iter_scopes(page):
+            if _scope_has_questions(scope):
+                return scope
+        if time.monotonic() >= deadline:
+            return None
+        try:
+            page.wait_for_timeout(500)
+        except Exception:
+            time.sleep(0.5)
+
+
+def _iter_scopes(page: Any):
+    yield page
+    frames = getattr(page, "frames", None)
+    if not frames:
+        return
+    main = getattr(page, "main_frame", None)
+    for frame in frames:
+        if frame is page or frame is main:
+            continue
+        yield frame
+
+
+def _scope_has_questions(scope: Any) -> bool:
+    try:
+        loc = scope.locator(".application--questions").first
+        return loc.count() > 0 and loc.is_visible()
+    except Exception:
+        return False
+
+
+def _fill_name_ids(scope: Any, applicant: Applicant) -> None:
+    """Type the profile name into inputs whose id is full_name, first_name, or last_name."""
+    values = {
+        "first_name": (applicant.first_name or "").strip(),
+        "last_name": (applicant.last_name or "").strip(),
+        "full_name": (applicant.full_name or "").strip(),
+    }
+    containers: list[Any] = []
+    try:
+        form = _questions_scope(scope)
+    except Exception:
+        form = scope
+    containers.append(form)
+    if scope is not form:
+        containers.append(scope)
+    for field_id, value in values.items():
+        if not value:
+            continue
+        for container in containers:
+            if _write_id_field(container, field_id, value):
+                break
+
+
+def _write_id_field(scope: Any, field_id: str, value: str) -> bool:
+    try:
+        loc = scope.locator(f'[id="{field_id}"]')
+        count = loc.count()
+    except Exception:
+        return False
+    for index in range(count):
+        handle = loc.nth(index)
+        try:
+            if not handle.is_visible():
+                continue
+            tag = (handle.evaluate("el => el.tagName") or "").lower()
+            if tag not in {"input", "textarea"}:
+                nested = handle.locator("input, textarea")
+                if nested.count() == 0:
+                    continue
+                handle = nested.first
+            current = ""
+            try:
+                current = _clean(handle.input_value(timeout=400))
+            except Exception:
+                current = ""
+            if current == _clean(value):
+                return True
+            if _write({"handle": handle, "type": "input:text"}, value):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _questions_scope(scope: Any):
+    """Search the application form, including fields that sit above the question block.
+
+    Greenhouse puts First Name, Email, Phone, and School outside `.application--questions`.
+    The question block's parent form contains both.
+    """
+    try:
+        questions = scope.locator(".application--questions")
+        if questions.count() > 0:
+            form = questions.first.locator("xpath=ancestor::form[1]")
+            if form.count() > 0:
+                return form.first
+            return questions.first
+    except Exception:
+        pass
+    return scope
+
+
+def _extract_fields(scope: Any, page: Any | None = None) -> list[dict[str, Any]]:
+    document = page or getattr(scope, "page", scope)
+    scope = _questions_scope(scope)
     fields: list[dict[str, Any]] = []
     try:
-        loc = page.locator("input:not([type='hidden']), textarea, select")
+        loc = scope.locator("input:not([type='hidden']), textarea, select")
         count = loc.count()
     except Exception:
         return fields
@@ -1141,28 +2889,73 @@ def _extract_fields(page: Any) -> list[dict[str, Any]]:
         try:
             if not handle.is_visible():
                 continue
+            if str(handle.get_attribute("aria-hidden") or "").lower() == "true":
+                continue
             in_chrome = handle.evaluate("el => !!el.closest('header, nav, footer')")
             if in_chrome:
                 continue
             tag = (handle.evaluate("el => el.tagName") or "").lower()
             input_type = (handle.get_attribute("type") or "text").lower() if tag == "input" else tag
             field_type = tag if tag in {"textarea", "select"} else f"input:{input_type}"
-            label = _label_for(page, handle)
+            label = _label_for(document, handle)
             group_label = _group_label(handle)
+            context = _nearby_text(handle)
             choice = ""
-            if field_type == "input:radio":
-                choice = _choice_label(page, handle) or label
+            if field_type in {"input:radio", "input:checkbox"}:
+                choice = _choice_label(document, handle) or label
             options = _select_options(handle) if field_type == "select" else []
             fields.append(
                 {
                     "handle": handle,
-                    "label": label or group_label or f"Field {index + 1}",
+                    "label": label or group_label or _humanize_control_name(handle.get_attribute("name") or handle.get_attribute("id") or "") or f"Field {index + 1}",
                     "group_label": group_label,
+                    "context": context,
                     "choice": choice,
                     "name": handle.get_attribute("name") or handle.get_attribute("id") or f"field_{index}",
                     "required": _is_required(handle),
                     "type": field_type,
                     "options": options,
+                }
+            )
+        except Exception:
+            continue
+    return fields
+
+
+def _extract_extra_controls(scope: Any, page: Any | None = None) -> list[dict[str, Any]]:
+    """Visible widgets that are not a plain input, textarea, or select."""
+    document = page or getattr(scope, "page", scope)
+    scope = _questions_scope(scope)
+    fields: list[dict[str, Any]] = []
+    try:
+        loc = scope.locator(_EXTRA_CONTROL_SELECTOR)
+        count = loc.count()
+    except Exception:
+        return fields
+    for index in range(min(count, 30)):
+        handle = loc.nth(index)
+        try:
+            if not handle.is_visible():
+                continue
+            tag = (handle.evaluate("el => el.tagName") or "").lower()
+            if tag in {"input", "textarea", "select"}:
+                continue
+            role = (handle.get_attribute("role") or "").lower()
+            editable = (handle.get_attribute("contenteditable") or "").lower() == "true"
+            field_type = "contenteditable" if editable and not role else f"role:{role or 'text'}"
+            label = _label_for(document, handle)
+            group_label = _group_label(handle)
+            fields.append(
+                {
+                    "handle": handle,
+                    "label": label or group_label or f"Control {index + 1}",
+                    "group_label": group_label,
+                    "context": _nearby_text(handle),
+                    "choice": "",
+                    "name": handle.get_attribute("id") or handle.get_attribute("name") or f"control_{index}",
+                    "required": _is_required(handle),
+                    "type": field_type,
+                    "options": [],
                 }
             )
         except Exception:
@@ -1198,6 +2991,23 @@ def _label_for(page: Any, handle: Any) -> str:
         if value and _clean(value):
             return _clean(value)
     return ""
+
+
+def _nearby_text(handle: Any) -> str:
+    """Text of the control's field wrapper, so the model sees the real question."""
+    try:
+        text = handle.evaluate(
+            """el => {
+                const wrap = el.closest(
+                    'fieldset, .field, .form-group, .application-question, .fb-form-element, li, [class*="question"], [class*="field"]'
+                ) || el.parentElement;
+                if (!wrap) return '';
+                return (wrap.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 280);
+            }"""
+        )
+    except Exception:
+        return ""
+    return _clean(text or "")[:280]
 
 
 def _group_label(handle: Any) -> str:
@@ -1280,16 +3090,76 @@ def _write(field: dict[str, Any], value: str) -> bool:
                 handle.check(timeout=1000)
                 return True
             return False
-        if field_type == "select":
-            return _select_choice(field, value)
         maxlength = handle.get_attribute("maxlength")
         text = value
-        if maxlength and maxlength.isdigit():
+        if maxlength and str(maxlength).isdigit():
             text = text[: int(maxlength)]
-        handle.fill(text, timeout=1500)
-        return True
+        role = (handle.get_attribute("role") or "").lower()
+        if role == "combobox" or field_type.startswith("role:combobox"):
+            handle.click(timeout=1000)
+            handle.fill(text, timeout=1500)
+            handle.press("Enter")
+            return _value_stuck(handle, text)
+        if field_type == "select":
+            return _select_choice(field, value)
+        if field_type == "contenteditable" or field_type.startswith("role:"):
+            handle.click(timeout=1000)
+        try:
+            handle.fill(text, timeout=1500)
+        except Exception:
+            pass
+        if _value_stuck(handle, text):
+            return True
+        handle.click(timeout=1000)
+        _set_native_value(handle, text)
+        return _value_stuck(handle, text)
     except Exception:
         return False
+
+
+def _value_stuck(handle: Any, text: str) -> bool:
+    try:
+        current = _clean(handle.input_value(timeout=400))
+    except Exception:
+        return False
+    wanted = _clean(text)
+    return bool(current) and (wanted in current or current in wanted)
+
+
+def _set_native_value(handle: Any, text: str) -> None:
+    """Set a React-controlled input when Playwright's fill does not stick."""
+    handle.evaluate(
+        """(el, value) => {
+            const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (setter && setter.set) setter.set.call(el, value);
+            else el.value = value;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        }""",
+        text,
+    )
+
+
+def _phone_prefix_option(options: list[str], prefix: str, country: str = "") -> str | None:
+    """The visible choice for a calling code, preferring +57 over a bare country name."""
+    digits = prefix.strip().lstrip("+")
+    if digits:
+        for option in options:
+            compact = option.replace(" ", "")
+            if f"+{digits}" in compact or re.search(rf"(?:^|\D){re.escape(digits)}(?:\D|$)", option):
+                return option
+    if country:
+        return _option_match(country, options)
+    return None
+
+
+def _select_phone_prefix(field: dict[str, Any], prefix: str, country: str = "") -> bool:
+    """Pick the dropdown option for this calling code, such as +57 or Colombia."""
+    chosen = _phone_prefix_option(list(field.get("options") or []), prefix, country)
+    if not chosen:
+        return False
+    return _select_choice(field, chosen)
 
 
 def _select_choice(field: dict[str, Any], desired: str) -> bool:
@@ -1332,6 +3202,10 @@ def _option_match(desired: str, options: list[str]) -> str | None:
         text = option.strip().lower()
         if len(wanted) > 3 and (wanted in text or text in wanted):
             return option
+    if wanted.startswith("+") and wanted[1:].isdigit():
+        for option in options:
+            if wanted in option.lower().replace(" ", ""):
+                return option
     return None
 
 
@@ -1340,6 +3214,8 @@ def _applicant_block(applicant: Applicant) -> str:
         f"Name: {applicant.full_name}",
         f"Email: {applicant.email}",
         f"Phone: {applicant.phone}",
+        f"Phone prefix: {applicant.phone_prefix}",
+        f"Phone number: {applicant.phone_number}",
         f"LinkedIn: {applicant.linkedin_url}",
         f"Portfolio: {applicant.portfolio_url}",
         f"Location: {applicant.location}",

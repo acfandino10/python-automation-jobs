@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from rich.console import Console
@@ -20,11 +21,24 @@ from src.cv_tailor import load_manifest  # noqa: E402
 from src.errors import AutoApplyError, ConfigError  # noqa: E402
 from src.job_applier import JobApplier  # noqa: E402
 from src.llm import build_llm  # noqa: E402
-from src.models import Manifest, ManifestRole  # noqa: E402
+from src.models import Applicant, Manifest, ManifestRole  # noqa: E402
 from src.people import PersonRun, applicant_for_run, person_runs, settings_for_person  # noqa: E402
 from src.tracking import ApplicationLog, start_of_local_day  # noqa: E402
 
 console = Console()
+_BOARD_CHOICES = (
+    ("Indeed", "indeed"),
+    ("LinkedIn", "linkedin"),
+    ("Greenhouse", "greenhouse"),
+)
+
+
+@dataclass
+class _PlannedRun:
+    applicant: Applicant
+    log_dir: Path
+    run_settings: Settings
+    roles: list[ManifestRole]
 
 
 def main() -> None:
@@ -46,15 +60,28 @@ def main() -> None:
             raise ConfigError("--threshold must be between 0 and 100.")
         runs = _runs(args, settings)
         if args.urls and len(runs) > 1:
-            raise ConfigError("Pass --manifest for one person when you use --urls.")
+            raise ConfigError("Pass --people or --manifest for one person when you use --urls.")
         llm = build_llm(settings)
         failures = 0
+        plans: list[_PlannedRun] = []
         for run in runs:
             try:
-                _apply_run(args, settings, llm, run, threshold)
+                plans.append(_plan_run(args, settings, run))
             except AutoApplyError as exc:
                 console.print(f"[red]{exc}[/red]")
                 failures += 1
+        if plans:
+            boards = [] if args.urls else _select_boards(args.boards, settings)
+            if "greenhouse" in boards and not settings.greenhouse_board_tokens():
+                console.print(
+                    "[yellow]Greenhouse needs company slugs in GREENHOUSE_BOARDS, such as stripe,airbnb.[/yellow]"
+                )
+            for plan in plans:
+                try:
+                    _apply_run(args, llm, plan, threshold, boards)
+                except AutoApplyError as exc:
+                    console.print(f"[red]{exc}[/red]")
+                    failures += 1
         if failures:
             raise SystemExit(1)
     except AutoApplyError as exc:
@@ -67,9 +94,18 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--manifest",
         default="",
-        help="One manifest.json. Omit this to apply every person under output/people, or the single output/tailored_cvs manifest.",
+        help="One manifest.json. Omit this to choose people under output/people, or the single output/tailored_cvs manifest.",
     )
-    parser.add_argument("--roles", default="", help="Comma-separated role titles or slugs from the manifest.")
+    parser.add_argument(
+        "--people",
+        default="",
+        help="Comma-separated person slugs or names. Use all for everyone. Omit this in a terminal to choose with a checkbox.",
+    )
+    parser.add_argument(
+        "--roles",
+        default="",
+        help="Comma-separated role titles or slugs. Use all for every role. Omit this in a terminal to choose with a checkbox.",
+    )
     parser.add_argument("--limit", type=int, default=10, help="Maximum matching applications to process this run.")
     parser.add_argument(
         "--daily-limit",
@@ -84,7 +120,11 @@ def _parser() -> argparse.ArgumentParser:
         help="Click submit on a recognized form. CAPTCHA, login, and unanswered required fields still pause.",
     )
     parser.add_argument("--threshold", type=int, default=None, help="Minimum CV match score. Defaults to MATCH_THRESHOLD.")
-    parser.add_argument("--boards", default="", help="Comma-separated override of SEARCH_BOARDS.")
+    parser.add_argument(
+        "--boards",
+        default="",
+        help="Comma-separated boards: indeed, linkedin, greenhouse. Use all for every board. Omit this in a terminal to choose with a checkbox.",
+    )
     parser.add_argument("--urls", default="", help="Text file of job URLs. Uses one selected role's PDF for every URL.")
     parser.add_argument("--headless", action="store_true", help="Hide the browser. Sign-in and CAPTCHA still need a visible browser.")
     return parser
@@ -105,10 +145,10 @@ def _runs(args, settings: Settings) -> list[PersonRun]:
         legacy = settings.project_root / "output" / "tailored_cvs" / "manifest.json"
         if legacy.exists():
             console.print(
-                "[yellow]Applying each person under output/people. "
+                "[yellow]People under output/people are available. "
                 "The older output/tailored_cvs manifest is not used.[/yellow]"
             )
-        return found
+        return _select_people(found, args.people)
     return [
         PersonRun(
             slug="",
@@ -119,7 +159,7 @@ def _runs(args, settings: Settings) -> list[PersonRun]:
     ]
 
 
-def _apply_run(args, settings: Settings, llm, run: PersonRun, threshold: int) -> None:
+def _plan_run(args, settings: Settings, run: PersonRun) -> _PlannedRun:
     manifest = load_manifest(run.manifest_path)
     source = settings.resolve(manifest.source_cv) if manifest.source_cv else Path()
     applicant = applicant_for_run(manifest.applicant, source)
@@ -139,7 +179,20 @@ def _apply_run(args, settings: Settings, llm, run: PersonRun, threshold: int) ->
     urls = settings.resolve(args.urls) if args.urls else None
     if urls and len(roles) != 1:
         raise ConfigError("Pass a single --roles value when you use --urls, so the matching PDF is unambiguous.")
-    boards = _boards(args.boards, run_settings)
+    return _PlannedRun(
+        applicant=applicant,
+        log_dir=log_dir,
+        run_settings=run_settings,
+        roles=roles,
+    )
+
+
+def _apply_run(args, llm, plan: _PlannedRun, threshold: int, boards: list[str]) -> None:
+    roles = plan.roles
+    log_dir = plan.log_dir
+    run_settings = plan.run_settings
+    applicant = plan.applicant
+    urls = run_settings.resolve(args.urls) if args.urls else None
     log = ApplicationLog(log_dir)
     try:
         run_limit = _run_limit(args.limit, args.daily_limit, log)
@@ -177,6 +230,71 @@ def _apply_run(args, settings: Settings, llm, run: PersonRun, threshold: int) ->
         log.close()
 
 
+def _select_people(runs: list[PersonRun], query: str) -> list[PersonRun]:
+    if query.strip():
+        return _people_from_query(runs, query)
+    if len(runs) == 1 or not sys.stdin.isatty():
+        return list(runs)
+    import questionary
+
+    choices = [questionary.Choice("All", value="all")]
+    choices.extend(questionary.Choice(_person_label(run), value=run.slug) for run in runs)
+    selected = _ask_checkbox("Which people should I apply for?", choices)
+    return _runs_for_selection(runs, selected)
+
+
+def _runs_for_selection(runs: list[PersonRun], selected: list[str]) -> list[PersonRun]:
+    if "all" in selected:
+        return list(runs)
+    chosen = {slug for slug in selected}
+    picked = [run for run in runs if run.slug in chosen]
+    if not picked:
+        raise ConfigError("Select All or at least one person.")
+    return picked
+
+
+def _people_from_query(runs: list[PersonRun], query: str) -> list[PersonRun]:
+    if query.strip().lower() == "all":
+        return list(runs)
+    labels = {run.slug: _person_label(run) for run in runs}
+    chosen: list[PersonRun] = []
+    for part in query.split(","):
+        needle = part.strip().lower()
+        if not needle:
+            continue
+        match = next((run for run in runs if _person_matches(run, needle)), None)
+        if match is None:
+            known = ", ".join(labels[run.slug] for run in runs)
+            raise ConfigError(f"Unknown person '{part.strip()}'. Available: {known}")
+        if all(match.slug != existing.slug for existing in chosen):
+            chosen.append(match)
+    if not chosen:
+        raise ConfigError("Pass at least one person, or all.")
+    return chosen
+
+
+def _person_label(run: PersonRun) -> str:
+    name = ""
+    try:
+        name = load_manifest(run.manifest_path).applicant.full_name.strip()
+    except AutoApplyError:
+        name = ""
+    slug = run.slug
+    if name and slug:
+        return f"{name} ({slug})"
+    return name or slug or run.manifest_path.parent.name
+
+
+def _person_matches(run: PersonRun, needle: str) -> bool:
+    if needle == run.slug.lower():
+        return True
+    try:
+        name = load_manifest(run.manifest_path).applicant.full_name.strip().lower()
+    except AutoApplyError:
+        return False
+    return bool(name) and needle == name
+
+
 def _select_roles(manifest: Manifest, query: str, label: str = "") -> list[ManifestRole]:
     if not manifest.roles:
         raise ConfigError("The manifest has no roles. Run generate_cvs.py first.")
@@ -189,17 +307,85 @@ def _select_roles(manifest: Manifest, query: str, label: str = "") -> list[Manif
         raise ConfigError(f"Pass --roles. Available slugs: {known}")
     import questionary
 
-    choices = [questionary.Choice(role.title, value=role.slug) for role in manifest.roles]
-    prompt = f"Which roles should I run for {label}?" if label else "Which roles should I run?"
-    selected = questionary.checkbox(prompt, choices=choices).ask()
+    choices = [questionary.Choice("All", value="all")]
+    choices.extend(questionary.Choice(role.title, value=role.slug) for role in manifest.roles)
+    prompt = f"Which roles should I apply for {label}?" if label else "Which roles should I apply for?"
+    selected = _ask_checkbox(prompt, choices)
+    return _roles_for_selection(manifest, selected)
+
+
+def _ask_checkbox(message: str, choices: list) -> list[str]:
+    """Checkbox where Enter on the highlighted row selects that row.
+
+    Space still checks several rows. Pressing Enter with nothing checked used
+    to submit an empty list and end the run.
+    """
+    import questionary
+
+    question = questionary.checkbox(
+        message,
+        choices=choices,
+        instruction="(Enter selects the highlighted row. Space checks several, then Enter.)",
+    )
+    _install_enter_selects_highlighted(question)
+    selected = question.ask()
     if selected is None:
         raise SystemExit(130)
-    if not selected:
-        raise ConfigError("Select at least one role.")
-    return [role for role in manifest.roles if role.slug in set(selected)]
+    return [str(value) for value in selected]
+
+
+def _install_enter_selects_highlighted(question) -> None:
+    from prompt_toolkit.keys import Keys
+
+    control = _inquirer_control(question.application)
+    bindings = question.application.key_bindings
+    bindings.remove(Keys.ControlM)
+
+    @bindings.add(Keys.ControlM, eager=True)
+    def set_answer(event):
+        if not control.selected_options and control.is_selection_valid():
+            control.selected_options.append(control.get_pointed_at().value)
+        selected = [choice.value for choice in control.get_selected_values()]
+        control.submission_attempted = True
+        control.is_answered = True
+        event.app.exit(result=selected)
+
+
+def _inquirer_control(application):
+    from prompt_toolkit.layout.containers import Window
+    from questionary.prompts.common import InquirerControl
+
+    found: list[InquirerControl] = []
+
+    def walk(node) -> None:
+        if isinstance(node, Window) and isinstance(node.content, InquirerControl):
+            found.append(node.content)
+            return
+        content = getattr(node, "content", None)
+        if content is not None:
+            walk(content)
+        for child in getattr(node, "children", None) or []:
+            walk(child)
+
+    walk(application.layout.container)
+    if not found:
+        raise ConfigError("Could not open the selection list.")
+    return found[0]
+
+
+def _roles_for_selection(manifest: Manifest, selected: list[str]) -> list[ManifestRole]:
+    if "all" in selected:
+        return list(manifest.roles)
+    chosen = {slug for slug in selected}
+    picked = [role for role in manifest.roles if role.slug in chosen]
+    if not picked:
+        raise ConfigError("Select All or at least one role.")
+    return picked
 
 
 def _roles_from_query(manifest: Manifest, query: str) -> list[ManifestRole]:
+    if query.strip().lower() == "all":
+        return list(manifest.roles)
     chosen: list[ManifestRole] = []
     for part in query.split(","):
         role = manifest.role_by_query(part)
@@ -211,7 +397,31 @@ def _roles_from_query(manifest: Manifest, query: str) -> list[ManifestRole]:
     return chosen
 
 
-def _boards(raw: str, settings) -> list[str]:
+def _select_boards(query: str, settings: Settings) -> list[str]:
+    if query.strip():
+        if query.strip().lower() == "all":
+            return [value for _label, value in _BOARD_CHOICES]
+        return _boards(query, settings)
+    if not sys.stdin.isatty():
+        return settings.board_list()
+    import questionary
+
+    choices = [questionary.Choice("All", value="all")]
+    choices.extend(questionary.Choice(label, value=value) for label, value in _BOARD_CHOICES)
+    return _boards_for_selection(_ask_checkbox("Which job boards should I apply on?", choices))
+
+
+def _boards_for_selection(selected: list[str]) -> list[str]:
+    if "all" in selected:
+        return [value for _label, value in _BOARD_CHOICES]
+    chosen = set(selected)
+    picked = [value for _label, value in _BOARD_CHOICES if value in chosen]
+    if not picked:
+        raise ConfigError("Select All or at least one job board.")
+    return picked
+
+
+def _boards(raw: str, settings: Settings) -> list[str]:
     if not raw.strip():
         return settings.board_list()
     settings.search_boards = raw
