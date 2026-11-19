@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{ cv.full_name }} — {{ cv.target_role }}</title>
+  <style>
+    @page { size: letter; margin: 0.65in; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: #111;
+      font-family: "Liberation Sans", Arial, Helvetica, sans-serif;
+      font-size: 11pt;
+      line-height: 1.35;
+    }
+    h1 { font-size: 18pt; line-height: 1.15; margin: 0 0 2px; }
+    .headline { margin: 0 0 4px; font-size: 11pt; }
+    .contact { margin: 0 0 8px; font-size: 10pt; color: #222; }
+    h2 {
+      font-size: 12pt;
+      margin: 14px 0 4px;
+      padding-bottom: 2px;
+      border-bottom: 1px solid #222;
+      letter-spacing: 0.02em;
+    }
+    p { margin: 0 0 6px; }
+    .job-title { font-weight: 700; margin: 8px 0 0; }
+    .meta { margin: 0 0 2px; font-size: 10pt; }
+    ul { margin: 2px 0 6px 18px; padding: 0; }
+    li { margin: 0 0 2px; }
+    .skills { margin: 0; }
+  </style>
+</head>
+<body>
+  <h1>{{ cv.full_name }}</h1>
+  {% if cv.headline %}<p class="headline">{{ cv.headline }}</p>{% endif %}
+  {% if cv.contact_line %}<p class="contact">{{ cv.contact_line }}</p>{% endif %}
+
+  {% if cv.summary %}
+  <h2>Summary</h2>
+  <p>{{ cv.summary }}</p>
+  {% endif %}
+
+  {% if cv.skills %}
+  <h2>Skills</h2>
+  <p class="skills">{{ cv.skills | join(" · ") }}</p>
+  {% endif %}
+
+  {% if cv.experience %}
+  <h2>Experience</h2>
+  {% for job in cv.experience %}
+    <p class="job-title">{{ job.title }}{% if job.company %} — {{ job.company }}{% endif %}</p>
+    <p class="meta">
+      {{- job.location -}}
+      {%- if job.location and job.dates %} · {% endif -%}
+      {{- job.dates -}}
+    </p>
+    {% if job.bullets %}
+    <ul>
+      {% for bullet in job.bullets %}
+      <li>{{ bullet }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  {% endfor %}
+  {% endif %}
+
+  {% if cv.projects %}
+  <h2>Projects</h2>
+  {% for project in cv.projects %}
+    <p class="job-title">{{ project.name }}</p>
+    {% if project.details %}
+    <ul>
+      {% for detail in project.details %}
+      <li>{{ detail }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  {% endfor %}
+  {% endif %}
+
+  {% if cv.education %}
+  <h2>Education</h2>
+  {% for school in cv.education %}
+    <p class="job-title">{{ school.degree }}{% if school.school %} — {{ school.school }}{% endif %}</p>
+    {% if school.dates %}<p class="meta">{{ school.dates }}</p>{% endif %}
+    {% if school.details %}
+    <ul>
+      {% for detail in school.details %}
+      <li>{{ detail }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  {% endfor %}
+  {% endif %}
+</body>
+</html>

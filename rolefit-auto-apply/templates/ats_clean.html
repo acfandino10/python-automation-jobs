@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>{{ cv.full_name }} — {{ cv.target_role }}</title>
+    <style>
+      @page {
+        size: letter;
+        margin: 0.65in 0.7in;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        color: #111111;
+        background: #ffffff;
+        font-family: "Liberation Sans", Arial, Helvetica, sans-serif;
+        font-size: 11pt;
+        line-height: 1.35;
+      }
+
+      h1,
+      h2,
+      p,
+      ul {
+        margin: 0;
+        padding: 0;
+      }
+
+      h1 {
+        font-size: 18pt;
+        font-weight: 700;
+        letter-spacing: 0;
+      }
+
+      .headline {
+        margin-top: 2px;
+        font-size: 11pt;
+      }
+
+      .contact {
+        margin-top: 4px;
+        font-size: 9.5pt;
+        color: #222222;
+      }
+
+      h2 {
+        margin-top: 14px;
+        padding-bottom: 2px;
+        border-bottom: 1px solid #111111;
+        font-size: 12pt;
+        font-weight: 700;
+        text-transform: none;
+      }
+
+      p {
+        margin-top: 6px;
+      }
+
+      .role {
+        margin-top: 8px;
+        font-weight: 700;
+      }
+
+      .meta {
+        font-style: italic;
+        font-size: 10pt;
+      }
+
+      ul {
+        margin: 2px 0 0 18px;
+      }
+
+      li {
+        margin: 1px 0;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>{{ cv.full_name }}</h1>
+    {% if cv.headline %}
+    <p class="headline">{{ cv.headline }}</p>
+    {% endif %}
+    {% if cv.contact_line %}
+    <p class="contact">{{ cv.contact_line }}</p>
+    {% endif %}
+
+    {% if cv.summary %}
+    <h2>Summary</h2>
+    <p>{{ cv.summary }}</p>
+    {% endif %}
+
+    {% if cv.skills %}
+    <h2>Skills</h2>
+    <p>{{ cv.skills | join(" · ") }}</p>
+    {% endif %}
+
+    {% if cv.experience %}
+    <h2>Experience</h2>
+    {% for job in cv.experience %}
+    <p class="role">
+      {{ job.title }}{% if job.company %} — {{ job.company }}{% endif %}
+    </p>
+    {% if job.location or job.dates %}
+    <p class="meta">{{ [job.location, job.dates] | select | join(" · ") }}</p>
+    {% endif %}
+    {% if job.bullets %}
+    <ul>
+      {% for bullet in job.bullets %}
+      <li>{{ bullet }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+    {% endfor %}
+    {% endif %}
+
+    {% if cv.projects %}
+    <h2>Projects</h2>
+    {% for project in cv.projects %}
+    <p class="role">{{ project.name }}</p>
+    {% if project.details %}
+    <ul>
+      {% for detail in project.details %}
+      <li>{{ detail }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+    {% endfor %}
+    {% endif %}
+
+    {% if cv.education %}
+    <h2>Education</h2>
+    {% for school in cv.education %}
+    <p class="role">
+      {{ school.degree }}{% if school.school %} — {{ school.school }}{% endif %}
+    </p>
+    {% if school.dates %}
+    <p class="meta">{{ school.dates }}</p>
+    {% endif %}
+    {% if school.details %}
+    <ul>
+      {% for detail in school.details %}
+      <li>{{ detail }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+    {% endfor %}
+    {% endif %}
+  </body>
+</html>

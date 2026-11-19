@@ -1,0 +1,27 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Resume files and filled-in personal config stay on this machine.
+local/
+assets/cvs/*
+!assets/cvs/.gitkeep
+logs/*
+!logs/.gitkeep
+
+assets/*
+
+
+# Tailored-CV engine. Generated PDFs, logs, and the browser profile stay local.
+auto-apply-engine/.env
+auto-apply-engine/.venv/
+auto-apply-engine/input/*
+!auto-apply-engine/input/.gitkeep
+auto-apply-engine/output/tailored_cvs/*
+!auto-apply-engine/output/tailored_cvs/.gitkeep
+auto-apply-engine/output/logs/*
+!auto-apply-engine/output/logs/.gitkeep
+auto-apply-engine/output/browser_profile/
+auto-apply-engine/output/people/

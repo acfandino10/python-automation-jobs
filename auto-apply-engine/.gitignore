@@ -1,0 +1,15 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+
+input/*
+!input/.gitkeep
+output/tailored_cvs/*
+!output/tailored_cvs/.gitkeep
+output/logs/*
+!output/logs/.gitkeep
+output/browser_profile/
+output/people/

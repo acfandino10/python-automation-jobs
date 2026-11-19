@@ -1,0 +1,12 @@
+# Search preferences. Copy to profile.yaml and edit.
+# Name, email, phone, links, and work authorization are read from the CV.
+# API keys belong in .env, never in this file.
+
+preferences:
+  job_location: "Remote"
+  remote_only: true
+  match_threshold: 75
+  search_boards:
+    - greenhouse
+  # Public Greenhouse board slugs. Example: [stripe, airbnb]
+  greenhouse_boards: []

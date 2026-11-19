@@ -1,0 +1,9 @@
+Name: Your Name
+Years of Experience: 3
+Core Skills: Python, SQL, Data Analysis, Excel, Communication
+Work Authorization: Authorized to work in target country
+Preferred Location: Remote / Hybrid
+Salary Expectation: Negotiable
+LinkedIn: https://linkedin.com/in/yourprofile
+Portfolio: https://your-portfolio.example
+Additional: Strong problem-solving, teamwork, and ownership mindset.

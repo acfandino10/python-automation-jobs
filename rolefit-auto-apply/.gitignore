@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Local configuration and generated artifacts
+.env
+profile.yaml
+output/
+input/*.pdf
+input/*.docx
+*.local.yaml
+
+# Editors
+.idea/
+.vscode/
+.DS_Store

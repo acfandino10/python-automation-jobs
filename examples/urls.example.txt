@@ -1,0 +1,2 @@
+https://example.com/job-1
+https://example.com/job-2
