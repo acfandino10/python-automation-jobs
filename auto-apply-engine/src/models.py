@@ -136,6 +136,7 @@ class Applicant(BaseModel):
     work_authorization: str = ""
     salary_expectation: str = ""
     school: str = ""
+    degree: str = ""
 
     @model_validator(mode="after")
     def _fill_name_parts(self) -> Applicant:

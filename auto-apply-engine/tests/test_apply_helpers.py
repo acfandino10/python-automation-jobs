@@ -7,6 +7,7 @@ import apply_jobs
 from src.config import Settings
 from src.errors import ConfigError
 from src.job_applier import (
+    LINKEDIN_NEXT_SELECTORS,
     _accept_easy_apply,
     _accept_next,
     _accept_submit,
@@ -39,8 +40,10 @@ def test_school_comes_from_the_first_education_entry(tmp_path: Path):
         json.dumps(
             {
                 "target_role": "Engineer",
+                "city": "Bogotá",
+                "country": "Colombia",
                 "education": [
-                    {"degree": "B.S.", "school": "Universidad de los Andes, Colombia", "dates": "2012 – 2017"},
+                    {"degree": "B.S. in Systems Engineering", "school": "Universidad de los Andes, Colombia", "dates": "2012 – 2017"},
                     {"degree": "Research", "school": "University of Wisconsin-Milwaukee (UWM), USA", "dates": "2016"},
                 ],
             }
@@ -54,7 +57,44 @@ def test_school_comes_from_the_first_education_entry(tmp_path: Path):
         html_path="role.html",
         metadata_path=str(metadata),
     )
+    from src.job_applier import _role_facts, _with_role_facts
+
+    facts = _role_facts(role, Settings())
+    assert facts.school == "Universidad de los Andes, Colombia"
+    assert facts.degree == "B.S. in Systems Engineering"
+    assert facts.city == "Bogotá"
+    assert facts.country == "Colombia"
+    filled = _with_role_facts(Applicant(full_name="Ana Fandiño", location="Remote"), facts)
+    assert filled.location == "Bogotá, Colombia"
+    assert filled.school == "Universidad de los Andes, Colombia"
+    assert filled.degree == "B.S. in Systems Engineering"
     assert _school_from_role(role, Settings()) == "Universidad de los Andes, Colombia"
+
+
+def test_stripe_fields_use_the_city_and_the_first_education_entry():
+    from src.job_applier import JobApplier
+
+    applicant = Applicant(
+        full_name="Ana Fandiño",
+        location="Bogotá, Colombia",
+        school="Universidad de los Andes, Colombia",
+        degree="B.S. in Systems Engineering",
+    )
+    city = _empty_field("Location (City)*", "input:text")
+    school = _empty_field("School*", "input:text")
+    country = _empty_field("Please select the country where you currently reside. *", "select")
+    degree = _empty_field("Degree", "select")
+    country["options"] = ["United States", "Colombia", "Canada"]
+    degree["options"] = ["High School", "Bachelor's Degree", "Master's Degree"]
+    for field in (city, school, country, degree):
+        field["handle"] = _MemoryHandle()
+        field["tag"] = "screening"
+        JobApplier._fill_tagged(object(), field, "screening", applicant, "CV", [], 0)
+
+    assert city["handle"].value == "Bogotá"
+    assert school["handle"].value == "Universidad de los Andes, Colombia"
+    assert country["handle"].value == "Colombia"
+    assert degree["handle"].value == "Bachelor's Degree"
 
 
 def test_name_ids_are_filled_from_the_split_name():
@@ -149,6 +189,10 @@ def test_profile_values_and_work_authorization():
     assert profile_value_for_label("First Name*", placed) == "Ana"
     assert profile_value_for_label("Country*", placed) == "Colombia"
     assert profile_value_for_label("Location (City)*", placed) == "Bogotá"
+    assert profile_value_for_label("Please select the country where you currently reside", placed) == "Colombia"
+    degreed = placed.model_copy(update={"degree": "B.S. in Systems Engineering", "school": "Universidad de los Andes, Colombia"})
+    assert profile_value_for_label("School*", degreed) == "Universidad de los Andes, Colombia"
+    assert profile_value_for_label("Degree", degreed) == "B.S. in Systems Engineering"
     prefixed = Applicant(phone="+57 319 482 6159", location="Bogotá, Colombia")
     assert profile_value_for_label("Country code", prefixed) == "+57"
     assert profile_value_for_label("Phone", prefixed) == "319 482 6159"
@@ -188,17 +232,26 @@ def test_linkedin_easy_apply_button_labels():
     assert _accept_easy_apply("Easy Apply to SDE at Acme")
     assert not _accept_easy_apply("Apply")
     assert _accept_next("Next")
+    assert _accept_next("Continue")
     assert _accept_next("Continue to next step")
     assert _accept_next("Review your application")
     assert not _accept_next("Next page")
+    assert not _accept_next("Back")
+    assert not _accept_next("Submit application")
     assert not _accept_next("")
     assert _accept_submit("Submit application")
+    assert not _accept_submit("Next")
     assert not _accept_submit("Submitted")
     assert not _accept_submit("")
+    joined = " ".join(LINKEDIN_NEXT_SELECTORS)
+    assert "Next" in joined
+    assert "Continue to next step" in joined
 
 
 def test_human_and_sensitive_questions():
     assert needs_human("https://www.indeed.com/jobs", "Please verify you are human")
+    assert needs_human("https://smartapply.indeed.com/form", "Are you a human?")
+    assert needs_human("https://www.indeed.com/jobs", "Before you continue, verify you are human")
     assert needs_human("https://www.linkedin.com/login", "Welcome")
     assert needs_human("https://example.com/jobs/1", "Python role") is None
     assert is_eeo_question("Gender (voluntary)")
